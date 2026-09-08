@@ -5,7 +5,10 @@ CREATE TABLE IF NOT EXISTS stores (
   store_key TEXT NOT NULL UNIQUE,   -- slug corto, ej. 'stanley', 'lalic', 'mathe'
   name TEXT NOT NULL,               -- nombre para mostrar, ej. 'Stanley 1913 MX'
   domain TEXT NOT NULL,             -- ej. stanley-1913-mx.myshopify.com
-  access_token TEXT NOT NULL,       -- pegado manualmente (Admin API access token)
+  client_id TEXT NOT NULL,          -- de tu app en Shopify Partners
+  client_secret TEXT NOT NULL,      -- de tu app en Shopify Partners
+  access_token TEXT NULL,           -- se llena solo al conectar (OAuth), no lo pegas a mano
+  token_expires_at TIMESTAMPTZ NULL,
   api_version TEXT NOT NULL DEFAULT '2024-10',
   location_id TEXT NULL,            -- requerido solo para programar inventario
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

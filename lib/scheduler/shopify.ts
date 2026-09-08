@@ -3,7 +3,10 @@ export type Store = {
   store_key: string;
   name: string;
   domain: string;
-  access_token: string;
+  client_id: string;
+  client_secret: string;
+  access_token: string | null;
+  token_expires_at: string | null;
   api_version: string;
   location_id: string | null;
 };
@@ -18,6 +21,9 @@ async function shopifyRequest(
   path: string,
   body?: Record<string, unknown>
 ): Promise<{ data: any; nextPageInfo: string | null }> {
+  if (!store.access_token) {
+    throw new Error(`La tienda '${store.name}' todavía no está conectada. Ve a "Tiendas" y dale clic en "Conectar".`);
+  }
   const domain = cleanDomain(store.domain);
   const url = `https://${domain}/admin/api/${store.api_version}${path}`;
 

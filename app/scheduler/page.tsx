@@ -2,7 +2,10 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
-type StoreOption = { id: number; store_key: string; name: string; has_token: boolean };
+type StoreOption = {
+  id: number; key: string; name: string;
+  state: 'connected' | 'expiring_soon' | 'expired' | 'not_connected';
+};
 type Variant = {
   id: number; variant_id: number; title: string | null; sku: string | null;
   price: string; compare_at_price: string | null; inventory_qty: number;
@@ -175,7 +178,7 @@ export default function SchedulerPage() {
         <label>Tienda:
           <select value={storeKey} onChange={e => setStoreKey(e.target.value)} className="ml-2 border rounded px-2 py-1">
             <option value="">-- Selecciona --</option>
-            {stores.map(s => <option key={s.store_key} value={s.store_key} disabled={!s.has_token}>{s.name}{!s.has_token ? ' (falta token)' : ''}</option>)}
+            {stores.map(s => <option key={s.key} value={s.key} disabled={s.state === 'not_connected'}>{s.name}{s.state === 'not_connected' ? ' (no conectada)' : ''}</option>)}
           </select>
         </label>
         <button disabled={!storeKey || syncing} onClick={doSync} className="px-3 py-1.5 bg-black text-white rounded disabled:opacity-40">Sincronizar productos</button>

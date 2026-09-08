@@ -20,23 +20,24 @@ export async function getStore(storeKey: string): Promise<Store> {
 }
 
 export async function createStore(input: {
-  storeKey: string; name: string; domain: string; accessToken: string; apiVersion: string; locationId?: string;
+  storeKey: string; name: string; domain: string; clientId: string; clientSecret: string;
+  apiVersion: string; locationId?: string;
 }) {
   const rows = await sql`
-    INSERT INTO stores (store_key, name, domain, access_token, api_version, location_id)
-    VALUES (${input.storeKey}, ${input.name}, ${input.domain}, ${input.accessToken}, ${input.apiVersion}, ${input.locationId || null})
+    INSERT INTO stores (store_key, name, domain, client_id, client_secret, api_version, location_id)
+    VALUES (${input.storeKey}, ${input.name}, ${input.domain}, ${input.clientId}, ${input.clientSecret}, ${input.apiVersion}, ${input.locationId || null})
     RETURNING id
   `;
   return rows[0].id as number;
 }
 
 export async function updateStore(id: number, input: {
-  name: string; domain: string; accessToken: string; apiVersion: string; locationId?: string;
+  name: string; domain: string; clientId?: string; clientSecret?: string; apiVersion: string; locationId?: string;
 }) {
-  if (input.accessToken) {
+  if (input.clientId && input.clientSecret) {
     await sql`
       UPDATE stores SET
-        name = ${input.name}, domain = ${input.domain}, access_token = ${input.accessToken},
+        name = ${input.name}, domain = ${input.domain}, client_id = ${input.clientId}, client_secret = ${input.clientSecret},
         api_version = ${input.apiVersion}, location_id = ${input.locationId || null}, updated_at = now()
       WHERE id = ${id}
     `;
@@ -48,6 +49,37 @@ export async function updateStore(id: number, input: {
       WHERE id = ${id}
     `;
   }
+}
+
+export async function saveStoreToken(storeKey: string, accessToken: string, expiresAt: string | null) {
+  await sql`
+    UPDATE stores SET access_token = ${accessToken}, token_expires_at = ${expiresAt}, updated_at = now()
+    WHERE store_key = ${storeKey}
+  `;
+}
+
+export type ConnectionStatus = {
+  id: number; key: string; name: string;
+  state: 'connected' | 'expiring_soon' | 'expired' | 'not_connected';
+  expiresAt: string | null; daysLeft: number | null;
+};
+
+export async function getConnectionStatus(): Promise<ConnectionStatus[]> {
+  const stores = await listStores();
+  const now = Date.now();
+  return stores.map(s => {
+    if (!s.access_token) {
+      return { id: s.id, key: s.store_key, name: s.name, state: 'not_connected' as const, expiresAt: null, daysLeft: null };
+    }
+    let state: ConnectionStatus['state'] = 'connected';
+    let daysLeft: number | null = null;
+    if (s.token_expires_at) {
+      daysLeft = Math.floor((new Date(s.token_expires_at).getTime() - now) / 86400000);
+      if (daysLeft < 0) state = 'expired';
+      else if (daysLeft <= 7) state = 'expiring_soon';
+    }
+    return { id: s.id, key: s.store_key, name: s.name, state, expiresAt: s.token_expires_at, daysLeft };
+  });
 }
 
 export async function deleteStore(id: number) {

@@ -75,21 +75,31 @@ npx vercel
 o conecta el repo desde el dashboard de Vercel. El archivo `vercel.json` ya
 trae el cron configurado.
 
-## 6. Agregar tiendas
+## 6. Agregar tiendas (OAuth, igual que tu app de inventario)
 
-Ve a **Tiendas** en el panel (`/stores`) y agrega cada una con:
-- Clave interna (slug corto, ej. `stanley`)
+Primero, en **Shopify Partners**, crea (o abre) la app para cada tienda y anota
+su **Client ID** y **Client Secret**. Agrega esta URL a sus "Allowed
+redirection URL(s)" (el panel de "Tiendas" te la muestra exacta, calculada
+según tu dominio real de Vercel):
+
+```
+https://tuapp.vercel.app/api/scheduler/oauth/callback
+```
+
+Luego, en el panel → **Tiendas** → llena:
+- Clave interna (slug, ej. `stanley`)
 - Nombre para mostrar
-- Dominio `tu-tienda.myshopify.com`
-- Access token (Admin API) — el que ya obtienes manualmente para tu app de
-  inventario: crea una app personalizada en Shopify Partners o en el admin
-  de la tienda, instálala con los permisos `read_products, write_products,
-  read_inventory, write_inventory, read_locations`, y copia el token.
-- API version (ej. `2024-10`)
-- Location ID (opcional, solo si vas a programar inventario — lo sacas de
-  Configuración → Ubicaciones en el admin de esa tienda)
+- Dominio `.myshopify.com`
+- Client ID / Client Secret (de Shopify Partners)
+- API version, Location ID (opcional)
 
-No hay flujo de OAuth — pegas el token directo, como ya haces en tu otra app.
+Guarda, y dale clic a **"Conectar"** en esa misma tienda — te manda al admin
+de Shopify a aprobar los permisos, y regresa automáticamente con el token
+guardado. Si el token vence, el panel te lo marca en amarillo/rojo y solo
+repites el mismo botón (ahora dice "Reconectar").
+
+No hay que pegar ningún access token a mano — eso es justo lo que resuelve el
+flujo OAuth.
 
 ## 7. Flujo de uso
 
@@ -119,7 +129,8 @@ curl -H "Authorization: Bearer TU_CRON_SECRET" https://tuapp.vercel.app/api/sche
 
 ## 9. Diferencias con la versión PHP/Hostinger
 
-- Conexión a Shopify: token manual (sin OAuth), guardado en la tabla `stores`.
+- Conexión a Shopify: OAuth real (Client ID/Secret guardados en la tabla
+  `stores`, igual que tu app de inventario), no un token pegado a mano.
 - Fechas: `TIMESTAMPTZ` de verdad (con zona horaria), y el frontend convierte
   el valor del `<input type="datetime-local">` a UTC real antes de mandarlo
   — evita el bug de UTC-vs-México que tuvimos con MySQL `DATETIME`.
