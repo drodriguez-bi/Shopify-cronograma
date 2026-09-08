@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
   }
 
   const res = NextResponse.json({ ok: true });
-  res.cookies.set(COOKIE_NAME, createSessionToken(), {
+  res.cookies.set(COOKIE_NAME, await createSessionToken(), {
     httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 60 * 60 * 24 * 7,
   });
   return res;
