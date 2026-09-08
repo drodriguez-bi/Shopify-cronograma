@@ -5,12 +5,31 @@ en fecha, agregar inventario en fecha, y precio promocional con reversión
 automática — con panel para agregar tiendas a mano (sin OAuth) y una forma de
 cargar cambios en bloque por CSV, además del panel manual.
 
-## ⚠️ Limitación de Vercel Cron
+## ⚠️ Cron real vía GitHub Actions (tu cuenta de Vercel es Hobby)
 
-Plan **Hobby (gratis)**: los cron jobs solo corren **una vez al día**, sin
-importar el `schedule` que pongas en `vercel.json`. El `*/5 * * * *` que dejé
-configurado solo funciona en plan **Pro**. Confirma tu plan antes de asumir
-que esto va a revisar tareas cada 5 minutos.
+Vercel Hobby solo permite cron jobs **una vez al día** — insuficiente para
+precios/publicaciones a hora exacta. `vercel.json` deja un cron diario como
+respaldo inofensivo, pero el disparo real cada 5 minutos lo hace un
+**workflow de GitHub Actions** (`.github/workflows/scheduler-cron.yml`), que
+no depende de Vercel para nada.
+
+Configúralo así, una vez que tu repo esté en GitHub:
+
+1. Ve a tu repo → **Settings → Secrets and variables → Actions**.
+2. Agrega dos "Repository secrets":
+   - `SCHEDULER_URL` → `https://tuapp.vercel.app` (sin slash al final)
+   - `SCHEDULER_CRON_SECRET` → el mismo valor que pusiste como `CRON_SECRET`
+     en las variables de entorno de Vercel
+3. Listo — GitHub va a llamar tu endpoint cada 5 minutos automáticamente.
+
+Puedes probarlo sin esperar: pestaña **Actions** de tu repo → selecciona el
+workflow "Scheduler cron (cada 5 min)" → botón **Run workflow**.
+
+Nota realista sobre GitHub Actions cron: no es preciso al segundo (puede
+atrasarse varios minutos en horas pico de GitHub), y **se desactiva solo si
+el repositorio pasa 60 días sin ningún commit** — si eso pasa, un commit
+cualquiera lo reactiva.
+
 
 ## 1. Instalar
 
