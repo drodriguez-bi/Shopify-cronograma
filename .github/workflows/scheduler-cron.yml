@@ -12,4 +12,4 @@ jobs:
       - name: Llamar al endpoint de cron del scheduler
         run: |
           curl -sf -H "Authorization: Bearer ${{ secrets.SCHEDULER_CRON_SECRET }}" \
-            "${{ secrets.SCHEDULER_URL }}/api/scheduler/cron"
+            "${{ vars.SCHEDULER_URL }}/api/scheduler/cron"
