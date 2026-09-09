@@ -61,3 +61,8 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status_run ON scheduled_tasks (status, run_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_revert ON scheduled_tasks (status, revert_at);
+
+-- location_id por tarea (para el flujo de "elegir sucursal" en el panel).
+-- Si una tarea de inventario no trae location_id propio, se usa el de la
+-- tienda como respaldo (location_id de la tabla stores).
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS location_id TEXT NULL;

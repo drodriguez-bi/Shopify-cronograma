@@ -159,12 +159,13 @@ export async function createPublishTask(storeKey: string, productId: string, lab
 
 export async function createInventoryTask(
   storeKey: string, productId: string, variantId: string, inventoryItemId: string | null,
-  label: string, quantity: number, mode: string, runAt: string, source: 'manual' | 'csv' = 'manual'
+  label: string, quantity: number, mode: string, runAt: string,
+  locationId: string | null = null, source: 'manual' | 'csv' = 'manual'
 ) {
   const payload = JSON.stringify({ quantity, mode });
   const rows = await sql`
-    INSERT INTO scheduled_tasks (store_key, type, product_id, variant_id, inventory_item_id, label, payload, run_at, source)
-    VALUES (${storeKey}, 'inventory', ${productId}, ${variantId}, ${inventoryItemId}, ${label}, ${payload}::jsonb, ${runAt}, ${source})
+    INSERT INTO scheduled_tasks (store_key, type, product_id, variant_id, inventory_item_id, label, payload, run_at, location_id, source)
+    VALUES (${storeKey}, 'inventory', ${productId}, ${variantId}, ${inventoryItemId}, ${label}, ${payload}::jsonb, ${runAt}, ${locationId}, ${source})
     RETURNING id
   `;
   return rows[0].id as number;
@@ -212,10 +213,11 @@ export async function runDueTasks(): Promise<{ ok: number; failed: number }> {
   for (const t of invRows) {
     try {
       const store = await getStore(t.store_key as string);
-      if (!store.location_id) throw new Error('location_id no configurado para esta tienda.');
+      const locationId = (t.location_id as string | null) || store.location_id;
+      if (!locationId) throw new Error('No hay location_id (ni en la tarea ni en la tienda).');
       const payload = t.payload as { quantity: number; mode: string };
-      if (payload.mode === 'set') await shopifySetInventory(store, String(t.inventory_item_id), store.location_id, payload.quantity);
-      else await shopifyAdjustInventory(store, String(t.inventory_item_id), store.location_id, payload.quantity);
+      if (payload.mode === 'set') await shopifySetInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
+      else await shopifyAdjustInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
       await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
       summary.ok++;
     } catch (e: any) {

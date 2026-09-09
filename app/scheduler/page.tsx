@@ -27,6 +27,9 @@ export default function SchedulerPage() {
   const router = useRouter();
   const [stores, setStores] = useState<StoreOption[]>([]);
   const [storeKey, setStoreKey] = useState('');
+  const [locations, setLocations] = useState<{ id: string; name: string; active: boolean }[]>([]);
+  const [locationId, setLocationId] = useState('');
+  const [loadingLocations, setLoadingLocations] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [selectedProducts, setSelectedProducts] = useState<Set<number>>(new Set());
   const [selectedVariants, setSelectedVariants] = useState<Set<number>>(new Set());
@@ -49,11 +52,24 @@ export default function SchedulerPage() {
   products.forEach(p => p.variants.forEach(v => variantById.set(v.id, { ...v, productTitle: p.title })));
 
   useEffect(() => { loadStores(); loadTasks(); }, []);
-  useEffect(() => { if (storeKey) loadProducts(storeKey); else setProducts([]); }, [storeKey]);
+  useEffect(() => {
+    setLocationId('');
+    setLocations([]);
+    setProducts([]);
+    if (storeKey) loadLocations(storeKey);
+  }, [storeKey]);
+  useEffect(() => { if (storeKey && locationId) loadProducts(storeKey); else setProducts([]); }, [storeKey, locationId]);
 
   async function loadStores() {
     const res = await fetch('/api/scheduler/stores').then(r => r.json());
     if (res.ok) setStores(res.stores);
+  }
+  async function loadLocations(key: string) {
+    setLoadingLocations(true);
+    const res = await fetch(`/api/scheduler/locations?storeKey=${encodeURIComponent(key)}`).then(r => r.json());
+    setLoadingLocations(false);
+    if (res.ok) setLocations(res.locations);
+    else alert('Error al cargar sucursales: ' + res.error);
   }
   async function loadProducts(key: string) {
     const res = await fetch(`/api/scheduler/products?storeKey=${encodeURIComponent(key)}`).then(r => r.json());
@@ -104,7 +120,7 @@ export default function SchedulerPage() {
     if (items.some(i => !i.quantity || i.quantity <= 0)) return alert('Falta cantidad válida en alguna variante.');
     const res = await fetch('/api/scheduler/tasks', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'schedule_inventory', storeKey, runAt: toIso(invRunAt), mode: invMode, items }),
+      body: JSON.stringify({ action: 'schedule_inventory', storeKey, runAt: toIso(invRunAt), mode: invMode, locationId, items }),
     }).then(r => r.json());
     finishSchedule(res);
   }
@@ -130,7 +146,7 @@ export default function SchedulerPage() {
     if (!csvText.trim()) return alert('Pega o carga un CSV primero.');
     const res = await fetch('/api/scheduler/tasks/csv', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ storeKey, csv: csvText }),
+      body: JSON.stringify({ storeKey, csv: csvText, locationId }),
     }).then(r => r.json());
     if (res.ok) { setCsvResult(res); loadTasks(); }
     else alert('Error: ' + res.error);
@@ -174,6 +190,24 @@ export default function SchedulerPage() {
         </div>
       </div>
 
+      <div className="flex flex-wrap gap-3">
+        {stores.map(s => (
+          <div key={s.key} className="flex items-center gap-2 bg-white shadow rounded-lg px-3 py-2 text-sm">
+            <span className={`w-2.5 h-2.5 rounded-full ${
+              s.state === 'connected' ? 'bg-green-600' :
+              s.state === 'expiring_soon' ? 'bg-yellow-500' :
+              s.state === 'expired' ? 'bg-red-600' : 'bg-gray-400'
+            }`} />
+            <span>{s.name} — {s.state === 'connected' ? 'Conectada' : s.state === 'expiring_soon' ? 'Token por vencer' : s.state === 'expired' ? 'Token vencido' : 'No conectada'}</span>
+            <a href={`/api/scheduler/oauth/install?store=${s.key}`}>
+              <button className="px-2 py-1 bg-black text-white rounded text-xs">
+                {s.state === 'not_connected' ? 'Conectar' : 'Reconectar'}
+              </button>
+            </a>
+          </div>
+        ))}
+      </div>
+
       <div className="flex items-center gap-3 bg-white shadow rounded-lg p-4 flex-wrap">
         <label>Tienda:
           <select value={storeKey} onChange={e => setStoreKey(e.target.value)} className="ml-2 border rounded px-2 py-1">
@@ -181,10 +215,17 @@ export default function SchedulerPage() {
             {stores.map(s => <option key={s.key} value={s.key} disabled={s.state === 'not_connected'}>{s.name}{s.state === 'not_connected' ? ' (no conectada)' : ''}</option>)}
           </select>
         </label>
-        <button disabled={!storeKey || syncing} onClick={doSync} className="px-3 py-1.5 bg-black text-white rounded disabled:opacity-40">Sincronizar productos</button>
-        <button disabled={!storeKey} onClick={() => { setCsvResult(null); setCsvText(''); setModal('csv'); }} className="px-3 py-1.5 bg-gray-700 text-white rounded disabled:opacity-40">Importar CSV</button>
+        <label>Sucursal:
+          <select value={locationId} onChange={e => setLocationId(e.target.value)} disabled={!storeKey || loadingLocations} className="ml-2 border rounded px-2 py-1 disabled:opacity-40">
+            <option value="">{loadingLocations ? 'Cargando...' : '-- Selecciona --'}</option>
+            {locations.map(l => <option key={l.id} value={l.id}>{l.name}{!l.active ? ' (inactiva)' : ''}</option>)}
+          </select>
+        </label>
+        <button disabled={!storeKey || !locationId || syncing} onClick={doSync} className="px-3 py-1.5 bg-black text-white rounded disabled:opacity-40">Sincronizar productos</button>
+        <button disabled={!storeKey || !locationId} onClick={() => { setCsvResult(null); setCsvText(''); setModal('csv'); }} className="px-3 py-1.5 bg-gray-700 text-white rounded disabled:opacity-40">Importar CSV</button>
         <span className="text-xs text-gray-500">{syncMsg}</span>
         {!stores.length && <span className="text-xs text-red-600">No hay tiendas — ve a "Tiendas" y agrega una.</span>}
+        {storeKey && !locationId && !loadingLocations && <span className="text-xs text-gray-500">Elige una sucursal para ver los productos.</span>}
       </div>
 
       {(selectedProducts.size > 0 || selectedVariants.size > 0) && (
@@ -201,7 +242,7 @@ export default function SchedulerPage() {
           <tr><th className="p-2 text-left">Publicar</th><th className="p-2 text-left">Imagen</th><th className="p-2 text-left">Producto</th><th className="p-2 text-left">Estado</th><th className="p-2 text-left">Variantes</th></tr>
         </thead>
         <tbody>
-          {products.length === 0 && <tr><td colSpan={5} className="p-3 text-gray-500">Selecciona una tienda y sincroniza.</td></tr>}
+          {products.length === 0 && <tr><td colSpan={5} className="p-3 text-gray-500">Selecciona tienda y sucursal, luego sincroniza.</td></tr>}
           {products.map(p => (
             <tr key={p.id} className="border-t">
               <td className="p-2"><input type="checkbox" checked={selectedProducts.has(p.id)} onChange={() => toggleProduct(p.id)} /></td>
@@ -324,7 +365,8 @@ export default function SchedulerPage() {
       {modal === 'csv' && (
         <Modal onClose={() => setModal(null)} title="Importar tareas por CSV" wide>
           <p className="text-xs text-gray-500 mb-2">
-            Encabezados: <code>type,sku,run_at,revert_at,quantity,mode,promo_price,compare_at_price,label</code>.
+            Encabezados: <code>type,sku,run_at,revert_at,quantity,mode,location_id,promo_price,compare_at_price,label</code>.
+            {' '}<code>location_id</code> es opcional para <code>inventory</code> (si lo dejas vacío, usa la sucursal seleccionada arriba: {locationId || 'ninguna elegida'}).
             <code>run_at</code>/<code>revert_at</code> en formato ISO con zona horaria, ej.{' '}
             <code>2026-07-10T15:00:00-06:00</code>. Deja vacías las columnas que no apliquen a cada fila.
             El SKU se busca en el catálogo ya sincronizado de esta tienda.

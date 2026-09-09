@@ -38,7 +38,7 @@ export async function POST(req: NextRequest) {
           body.storeKey, String(v.shopify_product_id), String(v.variant_id),
           v.inventory_item_id ? String(v.inventory_item_id) : null,
           item.label || (v.title as string) || `Variante ${v.variant_id}`,
-          item.quantity, body.mode, body.runAt
+          item.quantity, body.mode, body.runAt, body.locationId || null
         );
         created++;
       }

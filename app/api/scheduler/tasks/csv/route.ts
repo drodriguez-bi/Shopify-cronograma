@@ -4,7 +4,7 @@ import { findVariantBySku, createPublishTask, createInventoryTask, createPriceTa
 /**
  * Formato esperado del CSV (encabezados exactos, en cualquier orden):
  *
- * type,sku,run_at,revert_at,quantity,mode,promo_price,compare_at_price,label
+ * type,sku,run_at,revert_at,quantity,mode,location_id,promo_price,compare_at_price,label
  *
  * - type: publish | inventory | price
  * - sku: el SKU de la variante en Shopify (se busca en el catálogo ya sincronizado)
@@ -12,7 +12,10 @@ import { findVariantBySku, createPublishTask, createInventoryTask, createPriceTa
  *           (si no pones el offset, se asume la hora del servidor — evita ambigüedad
  *            poniendo siempre el -06:00 o el offset que corresponda)
  * - revert_at: solo para type=price, mismo formato que run_at
- * - quantity, mode (add|set): solo para type=inventory
+ * - quantity, mode (add|set), location_id: solo para type=inventory.
+ *   location_id es OPCIONAL — si lo dejas vacío, se usa el de la tienda (si tiene
+ *   uno configurado en "Tiendas"); si quieres apuntar a una sucursal específica,
+ *   ponlo aquí (lo sacas del selector de sucursal en el panel, o de Shopify).
  * - promo_price, compare_at_price: solo para type=price
  * - label: opcional, texto libre para identificar la tarea
  *
@@ -46,7 +49,7 @@ function splitCsvLine(line: string): string[] {
 }
 
 export async function POST(req: NextRequest) {
-  const { storeKey, csv } = await req.json();
+  const { storeKey, csv, locationId: fallbackLocationId } = await req.json();
   if (!storeKey || !csv) return NextResponse.json({ ok: false, error: 'storeKey y csv requeridos' }, { status: 400 });
 
   const rows = parseCsv(csv);
@@ -79,7 +82,7 @@ export async function POST(req: NextRequest) {
         await createInventoryTask(
           storeKey, String(variant.shopify_product_id), String(variant.variant_id),
           variant.inventory_item_id ? String(variant.inventory_item_id) : null,
-          label, quantity, mode, runAt, 'csv'
+          label, quantity, mode, runAt, row.location_id || fallbackLocationId || null, 'csv'
         );
       } else if (type === 'price') {
         const revertAt = row.revert_at;
