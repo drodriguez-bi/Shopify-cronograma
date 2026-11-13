@@ -187,9 +187,12 @@ export async function createInventoryTask(
 
 export async function createPriceTask(
   storeKey: string, productId: string, variantId: string, label: string,
-  promoPrice: number, compareAtPrice: number, runAt: string, revertAt: string, source: 'manual' | 'csv' = 'manual'
+  promoPrice: number, compareAtPrice: number, runAt: string, revertAt: string, source: 'manual' | 'csv' = 'manual',
+  // 'restore': al terminar vuelve al precio que tenía antes (respaldo leído al iniciar).
+  // 'compare_to_price': al terminar el precio de comparación pasa a ser el precio real y se quita el tachado.
+  endMode: 'restore' | 'compare_to_price' = 'restore'
 ) {
-  const payload = JSON.stringify({ promo_price: promoPrice.toFixed(2), compare_at_price: compareAtPrice.toFixed(2) });
+  const payload = JSON.stringify({ promo_price: promoPrice.toFixed(2), compare_at_price: compareAtPrice.toFixed(2), end_mode: endMode });
   const rows = await sql`
     INSERT INTO scheduled_tasks (store_key, type, product_id, variant_id, label, payload, run_at, revert_at, source)
     VALUES (${storeKey}, 'price', ${productId}, ${variantId}, ${label}, ${payload}::jsonb, ${runAt}, ${revertAt}, ${source})
@@ -278,9 +281,16 @@ export async function runDueTasks(): Promise<{ ok: number; failed: number }> {
   for (const t of priceRevertRows) {
     try {
       const store = await getStore(t.store_key as string);
-      const original = t.original_data as { price: string; compare_at_price: string | null };
-      if (!original?.price) throw new Error('Sin respaldo de precio original.');
-      await shopifyUpdateVariantPrice(store, String(t.variant_id), original.price, original.compare_at_price);
+      const payload = t.payload as { compare_at_price?: string; end_mode?: string } | null;
+      if (payload?.end_mode === 'compare_to_price') {
+        // El precio de comparación pasa a ser el precio real y el tachado se quita (null = sin precio de comparación).
+        if (!payload.compare_at_price) throw new Error('La tarea no trae precio de comparación.');
+        await shopifyUpdateVariantPrice(store, String(t.variant_id), payload.compare_at_price, null);
+      } else {
+        const original = t.original_data as { price: string; compare_at_price: string | null };
+        if (!original?.price) throw new Error('Sin respaldo de precio original.');
+        await shopifyUpdateVariantPrice(store, String(t.variant_id), original.price, original.compare_at_price);
+      }
       await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
       summary.ok++;
     } catch (e: any) {

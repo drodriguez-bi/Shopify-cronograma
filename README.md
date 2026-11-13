@@ -155,32 +155,34 @@ Para activarlo:
    GraphQL (`themes`, `themePublish`).
 
 
-## 11. Importar por CSV sin IDs (handle + variante)
+## 11. Importar por CSV (el archivo decide qué se programa)
 
-El CSV que exporta Shopify no trae IDs de producto ni de variante (y muchas
-variantes no tienen SKU), así que el importador identifica por **handle** y
-**variante** tal como se ven en Shopify.
-
-Para activarlo:
+Requisitos (una sola vez):
 1. Corre `sql/migration_handle.sql` en Neon (agrega la columna `handle`).
 2. En el panel, **Sincroniza productos** otra vez en cada tienda (así se llena el handle).
 
-Uso: en "Importar CSV" dale **Descargar plantilla con mi catálogo** (trae una fila
-por variante con handle, variante, SKU y precio/stock actuales de referencia),
-llena `type`, `run_at` y lo que aplique, y súbelo. También puedes partir del CSV
-exportado de Shopify: se entienden `Handle`, `Option1 Value`, `Option2 Value` y
-`Option3 Value`; solo agrega las columnas `type`, `run_at`, etc.
+Flujo en el panel → **Importar CSV**:
+1. Sube el archivo tal cual (o pega su contenido). El sistema decide la acción por sus columnas:
+   - trae `Variant Price` (o `promo_price`) → **cambio de precios**
+   - trae `quantity` (o `Variant Inventory Qty`) → **cambio de inventario**
+   - solo trae la lista de productos (`Handle`) → **publicar**
+   (Si un archivo trae precios y cantidades a la vez, gana precios; puedes forzar la acción en el selector.)
+2. Elige las fechas aquí mismo (inicio y fin si es precio; una fecha en los demás casos; modo sumar/fijar en inventario).
+3. **Revisar** muestra cuántas tareas se crearían, ejemplos y errores, sin crear nada. Después **Programar**.
 
-Columnas: `type` (publish | inventory | price), `handle`, `variant`, `sku`,
-`run_at`, `revert_at`, `quantity`, `mode`, `location_id`, `promo_price`,
-`compare_at_price`, `label`.
+Precio: al iniciar, el precio pasa a `Variant Price` y `Variant Compare At Price` queda como tachado
+(si va vacío o en 0, se usa el precio actual de la variante como tachado). Al terminar, el precio de
+comparación pasa a ser el precio real y el tachado se quita (sin precio de comparación). Las filas sin
+precio se omiten, así que sirven tal cual los CSV exportados de Shopify con sus filas de imágenes extra.
 
-- `variant`: ej. `Latte / 23`; `*` = todas las variantes del producto; vacío solo
-  si el producto tiene una variante.
-- `publish` solo necesita el handle; filas repetidas del mismo producto y fecha
-  crean una sola tarea.
-- `compare_at_price` vacío = usa el precio actual de la variante como tachado.
-- Fechas: `2026-12-01 09:00` (hora de México, UTC-06:00 por defecto; cámbialo con la
-  variable de entorno `SCHEDULER_TZ_OFFSET`), `2026-12-01T09:00:00-06:00` o `01/12/2026 09:00`.
-- Acepta archivos guardados desde Excel (BOM, separador `;`, apóstrofo `'23`).
-- Un CSV muy grande puede tardar; si da timeout, divídelo en partes.
+Cómo se identifica cada variante (sin IDs): `Handle` + las columnas `Option1 Value`, `Option2 Value`,
+`Option3 Value` (como el export de Shopify), o una columna `variant` con el texto tal como se ve en Shopify
+(ej. `Latte / 23`; `*` = todas las variantes). También sirve `sku`.
+
+Columnas opcionales por fila (mandan sobre el panel): `type`, `run_at`, `revert_at`, `mode`, `location_id`, `label`.
+Fechas en CSV: `2026-12-01 09:00` (hora de México, UTC-06:00; cámbialo con `SCHEDULER_TZ_OFFSET`),
+`2026-12-01T09:00:00-06:00` o `01/12/2026 09:00`.
+
+Las plantillas del panel (precios / inventario / publicar) bajan tu catálogo ya listado. Acepta archivos de Excel
+o Google Sheets (BOM, separador `;`, apóstrofo en tallas como `'23`). Un CSV muy grande puede tardar; si da
+timeout, divídelo en partes.
