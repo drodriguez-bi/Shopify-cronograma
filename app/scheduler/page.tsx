@@ -10,7 +10,7 @@ type Variant = {
   id: number; variant_id: number; title: string | null; sku: string | null;
   price: string; compare_at_price: string | null; inventory_qty: number;
 };
-type Product = { id: number; product_id: number; title: string; status: string; image_url: string | null; variants: Variant[] };
+type Product = { id: number; product_id: number; title: string; handle: string | null; status: string; image_url: string | null; variants: Variant[] };
 type Task = {
   id: number; store_key: string; type: string; label: string | null;
   run_at: string; revert_at: string | null; status: string; last_error: string | null; source: string;
@@ -50,7 +50,7 @@ export default function SchedulerPage() {
   const [priceEnd, setPriceEnd] = useState('');
   const [priceVals, setPriceVals] = useState<Record<number, { promo: string; compare: string }>>({});
   const [csvText, setCsvText] = useState('');
-  const [csvResult, setCsvResult] = useState<{ created: number; errors: { row: number; error: string }[] } | null>(null);
+  const [csvResult, setCsvResult] = useState<{ created: number; skipped?: number; errors: { row: number; error: string }[] } | null>(null);
 
   const variantById = new Map<number, Variant & { productTitle: string }>();
   products.forEach(p => p.variants.forEach(v => variantById.set(v.id, { ...v, productTitle: p.title })));
@@ -175,6 +175,28 @@ export default function SchedulerPage() {
     else alert('Error: ' + res.error);
   }
 
+  function downloadTemplate() {
+    const esc = (v: string | number | null | undefined) => {
+      const t = String(v ?? '');
+      return /[",\n;]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+    };
+    const header = ['type', 'handle', 'variant', 'sku', 'run_at', 'revert_at', 'quantity', 'mode', 'location_id', 'promo_price', 'compare_at_price', 'label', 'producto (referencia)', 'precio_actual (referencia)', 'stock_actual (referencia)'];
+    const lines = [header.join(',')];
+    for (const p of products) {
+      for (const v of p.variants) {
+        lines.push([
+          '', p.handle || '', v.title || '', v.sku || '', '', '', '', '', '', '', '', '',
+          p.title, v.price, v.inventory_qty,
+        ].map(esc).join(','));
+      }
+    }
+    const blob = new Blob(['\uFEFF' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `plantilla-${storeKey || 'tienda'}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
   function onCsvFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -408,12 +430,24 @@ export default function SchedulerPage() {
       {modal === 'csv' && (
         <Modal onClose={() => setModal(null)} title="Importar tareas por CSV" wide>
           <p className="text-xs text-gray-500 mb-2">
-            Encabezados: <code>type,sku,run_at,revert_at,quantity,mode,location_id,promo_price,compare_at_price,label</code>.
-            {' '}<code>location_id</code> es opcional para <code>inventory</code> (si lo dejas vacío, usa la sucursal seleccionada arriba: {locationId || 'ninguna elegida'}).
-            <code>run_at</code>/<code>revert_at</code> en formato ISO con zona horaria, ej.{' '}
-            <code>2026-07-10T15:00:00-06:00</code>. Deja vacías las columnas que no apliquen a cada fila.
-            El SKU se busca en el catálogo ya sincronizado de esta tienda.
+            No necesitas IDs: el producto se identifica por <code>handle</code> (el mismo del CSV que exporta Shopify)
+            y la <code>variant</code> tal como se ve en Shopify (ej. <code>Latte / 23</code>, o <code>*</code> para todas las variantes).
+            Si no pones <code>variant</code> pero tu archivo trae <code>Option1 Value</code>/<code>Option2 Value</code>, se arma sola.
+            También sirve <code>sku</code> en lugar de handle + variant.
           </p>
+          <p className="text-xs text-gray-500 mb-2">
+            Columnas: <code>type</code> (publish | inventory | price), <code>handle</code>, <code>variant</code>, <code>sku</code>,{' '}
+            <code>run_at</code>, <code>revert_at</code> (solo price), <code>quantity</code>, <code>mode</code> (add | set),{' '}
+            <code>location_id</code> (opcional; si falta usa la sucursal elegida arriba: {locationId || 'ninguna'}),{' '}
+            <code>promo_price</code>, <code>compare_at_price</code> (si falta usa el precio actual), <code>label</code>.
+            Fechas como <code>2026-12-01 09:00</code> (hora de México) o <code>01/12/2026 09:00</code>.
+            Para <code>publish</code> basta el handle.
+          </p>
+          <button type="button" onClick={downloadTemplate} disabled={!products.length}
+            className="mb-2 px-3 py-1.5 bg-gray-200 rounded text-sm disabled:opacity-40">
+            Descargar plantilla con mi catálogo
+          </button>
+          {!products.length && <span className="text-xs text-gray-500 ml-2">Sincroniza la tienda primero.</span>}
           <input type="file" accept=".csv,text/csv" onChange={onCsvFile} className="mb-2 text-sm" />
           <textarea
             value={csvText} onChange={e => setCsvText(e.target.value)}
@@ -422,7 +456,7 @@ export default function SchedulerPage() {
           />
           {csvResult && (
             <div className="text-xs mb-3 bg-gray-50 border rounded p-2 max-h-32 overflow-y-auto">
-              <p className="font-semibold">{csvResult.created} tarea(s) creada(s).</p>
+              <p className="font-semibold">{csvResult.created} tarea(s) creada(s).{csvResult.skipped ? ` ${csvResult.skipped} fila(s) repetida(s) omitida(s).` : ''}</p>
               {csvResult.errors.map((e, i) => <p key={i} className="text-red-600">Fila {e.row}: {e.error}</p>)}
             </div>
           )}

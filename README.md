@@ -153,3 +153,34 @@ Para activarlo:
 3. En el panel, dale **Reconectar** a cada tienda para que tome los scopes nuevos.
 4. La tienda debe usar una API version reciente (2024-10 o mayor) porque se usa
    GraphQL (`themes`, `themePublish`).
+
+
+## 11. Importar por CSV sin IDs (handle + variante)
+
+El CSV que exporta Shopify no trae IDs de producto ni de variante (y muchas
+variantes no tienen SKU), así que el importador identifica por **handle** y
+**variante** tal como se ven en Shopify.
+
+Para activarlo:
+1. Corre `sql/migration_handle.sql` en Neon (agrega la columna `handle`).
+2. En el panel, **Sincroniza productos** otra vez en cada tienda (así se llena el handle).
+
+Uso: en "Importar CSV" dale **Descargar plantilla con mi catálogo** (trae una fila
+por variante con handle, variante, SKU y precio/stock actuales de referencia),
+llena `type`, `run_at` y lo que aplique, y súbelo. También puedes partir del CSV
+exportado de Shopify: se entienden `Handle`, `Option1 Value`, `Option2 Value` y
+`Option3 Value`; solo agrega las columnas `type`, `run_at`, etc.
+
+Columnas: `type` (publish | inventory | price), `handle`, `variant`, `sku`,
+`run_at`, `revert_at`, `quantity`, `mode`, `location_id`, `promo_price`,
+`compare_at_price`, `label`.
+
+- `variant`: ej. `Latte / 23`; `*` = todas las variantes del producto; vacío solo
+  si el producto tiene una variante.
+- `publish` solo necesita el handle; filas repetidas del mismo producto y fecha
+  crean una sola tarea.
+- `compare_at_price` vacío = usa el precio actual de la variante como tachado.
+- Fechas: `2026-12-01 09:00` (hora de México, UTC-06:00 por defecto; cámbialo con la
+  variable de entorno `SCHEDULER_TZ_OFFSET`), `2026-12-01T09:00:00-06:00` o `01/12/2026 09:00`.
+- Acepta archivos guardados desde Excel (BOM, separador `;`, apóstrofo `'23`).
+- Un CSV muy grande puede tardar; si da timeout, divídelo en partes.

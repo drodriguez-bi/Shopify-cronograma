@@ -102,10 +102,11 @@ export async function syncProducts(storeKey: string): Promise<number> {
 
     for (const p of products) {
       await sql`
-        INSERT INTO products_cache (store_key, product_id, title, status, image_url)
-        VALUES (${storeKey}, ${p.id}, ${p.title}, ${p.status ?? 'draft'}, ${p.image?.src ?? null})
+        INSERT INTO products_cache (store_key, product_id, title, handle, status, image_url)
+        VALUES (${storeKey}, ${p.id}, ${p.title}, ${p.handle ?? null}, ${p.status ?? 'draft'}, ${p.image?.src ?? null})
         ON CONFLICT (store_key, product_id) DO UPDATE SET
-          title = EXCLUDED.title, status = EXCLUDED.status, image_url = EXCLUDED.image_url, updated_at = now()
+          title = EXCLUDED.title, handle = EXCLUDED.handle, status = EXCLUDED.status,
+          image_url = EXCLUDED.image_url, updated_at = now()
       `;
       const found = await sql`SELECT id FROM products_cache WHERE store_key = ${storeKey} AND product_id = ${p.id}`;
       const productCacheId = found[0].id as number;
@@ -143,6 +144,18 @@ export async function findVariantBySku(storeKey: string, sku: string) {
     LIMIT 1
   `;
   return rows[0] ?? null;
+}
+
+/** Producto + todas sus variantes, buscado por handle (el que trae el CSV exportado de Shopify). */
+export async function findProductByHandle(storeKey: string, handle: string) {
+  const products = await sql`
+    SELECT * FROM products_cache WHERE store_key = ${storeKey} AND lower(handle) = ${handle.toLowerCase()} LIMIT 1
+  `;
+  if (!products.length) return null;
+  const variants = await sql`
+    SELECT * FROM variants_cache WHERE product_cache_id = ${products[0].id} ORDER BY id
+  `;
+  return { product: products[0], variants };
 }
 
 // ---------------------------------------------------------

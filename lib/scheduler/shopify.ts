@@ -59,7 +59,7 @@ async function shopifyRequest(
 export async function shopifyListProducts(store: Store, pageInfo?: string) {
   const path = pageInfo
     ? `/products.json?limit=250&page_info=${encodeURIComponent(pageInfo)}`
-    : `/products.json?limit=250&fields=id,title,status,image,variants`;
+    : `/products.json?limit=250&fields=id,title,handle,status,image,variants`;
   return shopifyRequest(store, 'GET', path);
 }
 export async function shopifySetProductStatus(store: Store, productId: string, status: string) {

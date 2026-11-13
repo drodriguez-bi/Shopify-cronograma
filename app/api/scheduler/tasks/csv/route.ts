@@ -1,105 +1,259 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { findVariantBySku, createPublishTask, createInventoryTask, createPriceTask } from '@/lib/scheduler/core';
+import {
+  findVariantBySku, findProductByHandle,
+  createPublishTask, createInventoryTask, createPriceTask,
+} from '@/lib/scheduler/core';
+
+export const maxDuration = 60;
 
 /**
- * Formato esperado del CSV (encabezados exactos, en cualquier orden):
+ * FORMATO DEL CSV (los encabezados no distinguen mayúsculas; el orden da igual)
  *
- * type,sku,run_at,revert_at,quantity,mode,location_id,promo_price,compare_at_price,label
+ *   type, handle, variant, sku, run_at, revert_at, quantity, mode, location_id,
+ *   promo_price, compare_at_price, label
  *
- * - type: publish | inventory | price
- * - sku: el SKU de la variante en Shopify (se busca en el catálogo ya sincronizado)
- * - run_at: fecha/hora ISO CON zona horaria, ej. 2026-07-10T15:00:00-06:00
- *           (si no pones el offset, se asume la hora del servidor — evita ambigüedad
- *            poniendo siempre el -06:00 o el offset que corresponda)
- * - revert_at: solo para type=price, mismo formato que run_at
- * - quantity, mode (add|set), location_id: solo para type=inventory.
- *   location_id es OPCIONAL — si lo dejas vacío, se usa el de la tienda (si tiene
- *   uno configurado en "Tiendas"); si quieres apuntar a una sucursal específica,
- *   ponlo aquí (lo sacas del selector de sucursal en el panel, o de Shopify).
- * - promo_price, compare_at_price: solo para type=price
- * - label: opcional, texto libre para identificar la tarea
+ * Cómo se identifica el producto (NO hace falta ningún ID de Shopify):
+ *   - handle: el "Handle" del CSV que exporta Shopify (ej. eileen-latte).
+ *   - variant: la variante tal como se ve en Shopify, ej. "Latte / 23".
+ *       · "*" = todas las variantes del producto.
+ *       · vacío = solo vale si el producto tiene UNA sola variante.
+ *       · Si no pones la columna "variant" pero tu archivo trae las columnas
+ *         "Option1 Value", "Option2 Value", "Option3 Value" (como el export de
+ *         Shopify), la variante se arma sola con ellas.
+ *   - sku: alternativa a handle+variant, si tus variantes tienen SKU.
  *
- * Deja vacías las columnas que no apliquen a cada fila.
+ * type: publish | inventory | price
+ *   - publish: basta el handle (publica el producto completo; si repites el
+ *     mismo producto en varias filas con la misma fecha, solo se crea una tarea).
+ *   - inventory: quantity, mode (add|set), location_id (opcional).
+ *   - price: promo_price, compare_at_price (si lo dejas vacío usa el precio actual
+ *     de la variante como tachado) y revert_at.
+ *
+ * Fechas (run_at / revert_at), cualquiera de estas:
+ *   2026-12-01 09:00          (se asume hora de México, UTC-06:00)
+ *   2026-12-01T09:00:00-06:00 (con zona horaria explícita)
+ *   01/12/2026 09:00          (día/mes/año)
+ *   La zona por defecto se puede cambiar con la variable SCHEDULER_TZ_OFFSET.
  */
 
-function parseCsv(text: string): Record<string, string>[] {
-  const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
-  if (!lines.length) return [];
-  const headers = splitCsvLine(lines[0]);
-  return lines.slice(1).map(line => {
-    const values = splitCsvLine(line);
+const DEFAULT_TZ_OFFSET = process.env.SCHEDULER_TZ_OFFSET || '-06:00';
+
+// ---------------------------------------------------------
+// Lectura del CSV
+// ---------------------------------------------------------
+
+function detectDelimiter(text: string): string {
+  const firstLine = text.split(/\r?\n/, 1)[0] ?? '';
+  const counts: Record<string, number> = { ',': 0, ';': 0, '\t': 0 };
+  let inQuotes = false;
+  for (const ch of firstLine) {
+    if (ch === '"') inQuotes = !inQuotes;
+    else if (!inQuotes && ch in counts) counts[ch]++;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+}
+
+function parseCsv(raw: string): Record<string, string>[] {
+  const text = raw.replace(/^\uFEFF/, ''); // BOM que mete Excel
+  const delim = detectDelimiter(text);    // Excel en español suele guardar con ";"
+  const records: string[][] = [];
+  let field = '';
+  let record: string[] = [];
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delim) {
+      record.push(field); field = '';
+    } else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      record.push(field); field = '';
+      if (record.some(f => f.trim() !== '')) records.push(record);
+      record = [];
+    } else field += ch;
+  }
+  record.push(field);
+  if (record.some(f => f.trim() !== '')) records.push(record);
+  if (!records.length) return [];
+
+  const headers = records[0].map(h => h.trim().toLowerCase());
+  return records.slice(1).map(values => {
     const row: Record<string, string> = {};
-    headers.forEach((h, i) => { row[h.trim()] = (values[i] ?? '').trim(); });
+    headers.forEach((h, i) => { row[h] = (values[i] ?? '').trim(); });
     return row;
   });
 }
 
-function splitCsvLine(line: string): string[] {
-  const result: string[] = [];
-  let cur = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') { inQuotes = !inQuotes; continue; }
-    if (ch === ',' && !inQuotes) { result.push(cur); cur = ''; continue; }
-    cur += ch;
-  }
-  result.push(cur);
-  return result;
+// ---------------------------------------------------------
+// Utilidades
+// ---------------------------------------------------------
+
+/** Compara variantes sin importar mayúsculas, espacios ni el apóstrofo que mete Shopify/Excel ('23). */
+function norm(s: string): string {
+  return s.replace(/(^|\/\s*)'+/g, '$1').trim().toLowerCase().replace(/\s*\/\s*/g, ' / ').replace(/\s+/g, ' ');
 }
+
+function variantSpecFromRow(row: Record<string, string>): string {
+  if (row.variant) return row.variant;
+  const parts = [row['option1 value'], row['option2 value'], row['option3 value']]
+    .map(p => (p ?? '').replace(/^'+/, '').trim())
+    .filter(Boolean);
+  return parts.join(' / ');
+}
+
+function parseDate(value: string, field: string): string {
+  const v = (value || '').replace(/^'+/, '').trim();
+  if (!v) throw new Error(`falta ${field}`);
+
+  let d: Date | null = null;
+  const hasZone = /(Z|[+-]\d{2}:?\d{2})$/i.test(v) && /T|\s/.test(v);
+  const iso = v.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  const latin = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[T\s](\d{1,2}):(\d{2}))?$/);
+
+  if (hasZone) {
+    d = new Date(v.replace(' ', 'T'));
+  } else if (iso) {
+    const [, y, m, day, hh = '00', mm = '00', ss = '00'] = iso;
+    d = new Date(`${y}-${m}-${day}T${hh.padStart(2, '0')}:${mm}:${ss}${DEFAULT_TZ_OFFSET}`);
+  } else if (latin) {
+    const [, day, m, y, hh = '00', mm = '00'] = latin;
+    d = new Date(`${y}-${m.padStart(2, '0')}-${day.padStart(2, '0')}T${hh.padStart(2, '0')}:${mm}:00${DEFAULT_TZ_OFFSET}`);
+  }
+  if (!d || isNaN(d.getTime())) throw new Error(`${field} inválida: "${value}"`);
+  return d.toISOString();
+}
+
+function parseMoney(value: string): number {
+  let v = (value || '').replace(/[$\s]/g, '');
+  if (!v) return NaN;
+  if (!v.includes('.') && /,\d{1,2}$/.test(v)) v = v.replace(',', '.'); // 2749,00 -> 2749.00
+  else v = v.replace(/,/g, '');                                          // 2,749.00 -> 2749.00
+  return parseFloat(v);
+}
+
+// ---------------------------------------------------------
+// Handler
+// ---------------------------------------------------------
+
+type Found = NonNullable<Awaited<ReturnType<typeof findProductByHandle>>>;
 
 export async function POST(req: NextRequest) {
   const { storeKey, csv, locationId: fallbackLocationId } = await req.json();
   if (!storeKey || !csv) return NextResponse.json({ ok: false, error: 'storeKey y csv requeridos' }, { status: 400 });
 
   const rows = parseCsv(csv);
+  if (!rows.length) return NextResponse.json({ ok: false, error: 'El CSV no trae filas.' }, { status: 400 });
+
   let created = 0;
+  let skipped = 0;
   const errors: { row: number; error: string }[] = [];
+
+  const productCache = new Map<string, Found | null>();
+  async function getProduct(handle: string) {
+    const key = handle.toLowerCase();
+    if (!productCache.has(key)) productCache.set(key, await findProductByHandle(storeKey, handle));
+    return productCache.get(key) ?? null;
+  }
+  const publishSeen = new Set<string>();
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     try {
-      const type = row.type;
+      const type = (row.type || '').toLowerCase();
       if (!['publish', 'inventory', 'price'].includes(type)) {
-        throw new Error(`type inválido: "${type}"`);
+        throw new Error(`type inválido: "${row.type}" (usa publish, inventory o price)`);
       }
-      if (!row.sku) throw new Error('falta sku');
+      const runAt = parseDate(row.run_at, 'run_at');
 
-      const variant = await findVariantBySku(storeKey, row.sku);
-      if (!variant) throw new Error(`no se encontró el SKU "${row.sku}" en el catálogo sincronizado`);
+      // ---- Identificar producto / variantes ----
+      let productId = '';
+      let productTitle = '';
+      let variants: any[] = [];
 
-      const runAt = row.run_at;
-      if (!runAt || isNaN(new Date(runAt).getTime())) throw new Error(`run_at inválido: "${runAt}"`);
+      if (row.sku) {
+        const v = await findVariantBySku(storeKey, row.sku);
+        if (!v) throw new Error(`no se encontró el SKU "${row.sku}" en el catálogo sincronizado`);
+        productId = String(v.shopify_product_id);
+        productTitle = (v.product_title as string) || '';
+        variants = [v];
+      } else if (row.handle) {
+        const found = await getProduct(row.handle);
+        if (!found) throw new Error(`no se encontró el handle "${row.handle}" (¿ya sincronizaste esta tienda después de la actualización?)`);
+        productId = String(found.product.product_id);
+        productTitle = found.product.title as string;
 
-      const label = row.label || (variant.title as string) || row.sku;
+        if (type !== 'publish') {
+          const spec = variantSpecFromRow(row);
+          const all = found.variants;
+          if (spec === '*' || norm(spec) === 'todas' || norm(spec) === 'all') {
+            variants = all;
+          } else if (!spec) {
+            if (all.length === 1) variants = all;
+            else throw new Error(`"${row.handle}" tiene ${all.length} variantes: indica la columna variant (ej. "${all[0]?.title}") o "*" para todas`);
+          } else {
+            variants = all.filter(v => norm((v.title as string) || '') === norm(spec));
+            if (!variants.length) {
+              const sample = all.slice(0, 4).map(v => v.title).join(' | ');
+              throw new Error(`"${row.handle}" no tiene la variante "${spec}". Ejemplos: ${sample}`);
+            }
+          }
+        }
+      } else {
+        throw new Error('falta handle (o sku) para identificar el producto');
+      }
 
+      // ---- Crear tareas ----
       if (type === 'publish') {
-        await createPublishTask(storeKey, String(variant.shopify_product_id), label, runAt, 'csv');
-      } else if (type === 'inventory') {
+        const key = `${productId}|${runAt}`;
+        if (publishSeen.has(key)) { skipped++; continue; }
+        publishSeen.add(key);
+        await createPublishTask(storeKey, productId, row.label || productTitle, runAt, 'csv');
+        created++;
+        continue;
+      }
+
+      if (type === 'inventory') {
         const quantity = parseInt(row.quantity, 10);
         const mode = row.mode === 'set' ? 'set' : 'add';
         if (!quantity || quantity <= 0) throw new Error(`quantity inválido: "${row.quantity}"`);
-        await createInventoryTask(
-          storeKey, String(variant.shopify_product_id), String(variant.variant_id),
-          variant.inventory_item_id ? String(variant.inventory_item_id) : null,
-          label, quantity, mode, runAt, row.location_id || fallbackLocationId || null, 'csv'
-        );
-      } else if (type === 'price') {
-        const revertAt = row.revert_at;
-        const promo = parseFloat(row.promo_price);
-        const compare = parseFloat(row.compare_at_price);
-        if (!revertAt || isNaN(new Date(revertAt).getTime())) throw new Error(`revert_at inválido: "${revertAt}"`);
-        if (!promo || !compare) throw new Error('promo_price o compare_at_price inválido');
-        await createPriceTask(
-          storeKey, String(variant.shopify_product_id), String(variant.variant_id),
-          label, promo, compare, runAt, revertAt, 'csv'
-        );
+        for (const v of variants) {
+          await createInventoryTask(
+            storeKey, productId, String(v.variant_id),
+            v.inventory_item_id ? String(v.inventory_item_id) : null,
+            row.label || `${productTitle} — ${v.title ?? ''}`.trim(),
+            quantity, mode, runAt, row.location_id || fallbackLocationId || null, 'csv'
+          );
+          created++;
+        }
+        continue;
       }
-      created++;
+
+      // type === 'price'
+      const revertAt = parseDate(row.revert_at, 'revert_at');
+      if (new Date(revertAt) <= new Date(runAt)) throw new Error('revert_at debe ser posterior a run_at');
+      const promo = parseMoney(row.promo_price);
+      if (!promo || promo <= 0) throw new Error(`promo_price inválido: "${row.promo_price}"`);
+      for (const v of variants) {
+        const compare = row.compare_at_price ? parseMoney(row.compare_at_price) : parseFloat(String(v.price));
+        if (!compare || compare <= 0) throw new Error(`compare_at_price inválido: "${row.compare_at_price}"`);
+        await createPriceTask(
+          storeKey, productId, String(v.variant_id),
+          row.label || `${productTitle} — ${v.title ?? ''}`.trim(),
+          promo, compare, runAt, revertAt, 'csv'
+        );
+        created++;
+      }
     } catch (e: any) {
-      errors.push({ row: i + 2, error: e.message }); // +2: fila 1 es encabezado, index base 0
+      errors.push({ row: i + 2, error: e.message }); // +2: fila 1 es el encabezado
     }
   }
 
-  return NextResponse.json({ ok: true, created, errors });
+  return NextResponse.json({ ok: true, created, skipped, errors });
 }
