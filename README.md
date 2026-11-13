@@ -186,3 +186,43 @@ Fechas en CSV: `2026-12-01 09:00` (hora de México, UTC-06:00; cámbialo con `SC
 Las plantillas del panel (precios / inventario / publicar) bajan tu catálogo ya listado. Acepta archivos de Excel
 o Google Sheets (BOM, separador `;`, apóstrofo en tallas como `'23`). Un CSV muy grande puede tardar; si da
 timeout, divídelo en partes.
+
+## 12. Límite de llamadas de Shopify (error 429) y tareas fallidas
+
+Shopify permite ~2 llamadas REST por segundo (con una ráfaga inicial de 40). Una promo con muchas variantes
+las dispara todas a la vez, así que el cron:
+- espera y reintenta solo cuando Shopify responde 429 (respeta `Retry-After`) y baja el ritmo cuando el cupo está casi lleno;
+- usa una sola llamada por variante en los precios importados por CSV (no necesita leer el precio actual);
+- trabaja con un presupuesto de ~50 segundos por corrida: si hay más tareas vencidas de las que alcanza, las
+  restantes se quedan "pendientes" y las toma la siguiente corrida (la respuesta del cron trae `deferred` con cuántas faltan).
+  Un lote muy grande puede tardar 2 o 3 corridas (cada 5 minutos) en terminar.
+
+Las tareas que ya quedaron "fallidas" por el 429 se recuperan con **Reintentar** (por tarea) o **Reintentar fallidas**
+(todas) en la tabla de tareas. Una promo que ya había iniciado solo reintenta el término; no vuelve a aplicar el precio.
+
+## 13. Una sola tarea por acción (lotes)
+
+Antes se creaba una tarea por cada variante (111 variantes = 111 tareas y 111 llamadas a Shopify). Ahora, tanto desde
+el panel como desde el CSV, cada acción crea **una sola tarea** con toda la lista adentro:
+**Precio promo**, **Inventario** y **Publicar**. En "Tareas programadas" aparece una fila (ej. "Precio promo: 111
+variante(s) en 19 producto(s)") con un botón **Detalle** que muestra la lista completa.
+
+Al ejecutarse usa la API GraphQL de Shopify (no tiene el límite de 2 llamadas por segundo del REST):
+- precio: una llamada por producto actualiza todas sus variantes (`productVariantsBulkUpdate`);
+- inventario: una llamada por cada 100 variantes (`inventoryAdjustQuantities` / `inventorySetQuantities`);
+- publicar: una llamada por producto, en paralelo (`productChangeStatus`).
+
+El avance se guarda en la tarea: si se acaba el tiempo de la corrida, la siguiente continúa donde se quedó; si falla
+un producto, la tarea queda "fallida" con el detalle y **Reintentar** repite solo lo que falló. Las tareas antiguas
+(una por variante) siguen funcionando igual.
+
+Para activarlo: corre `sql/migration_batch.sql` en Neon **antes** de desplegar. Requiere API version 2024-10 o mayor en
+la tienda y los scopes que ya tienes (`write_products`, `write_inventory`). Pruébalo primero en la tienda "Prueba" con
+una promo de pocos minutos.
+
+## 14. Selección en el panel
+
+Marcar un producto marca todas sus variantes (puedes desmarcar alguna); la casilla "Todos" selecciona toda la lista
+visible, y el buscador filtra por nombre o handle para seleccionar solo lo filtrado. En los modales de precio e
+inventario los productos salen agrupados: un solo campo por producto llena todas sus variantes y después puedes
+ajustar una por una.

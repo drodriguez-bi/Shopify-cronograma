@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 type StoreOption = {
@@ -14,10 +14,12 @@ type Product = { id: number; product_id: number; title: string; handle: string |
 type Task = {
   id: number; store_key: string; type: string; label: string | null;
   run_at: string; revert_at: string | null; status: string; last_error: string | null; source: string;
+  item_count?: number | null;
 };
 
 const statusLabels: Record<string, string> = { pending: 'Pendiente', active: 'Activa', completed: 'Completada', failed: 'Fallida', cancelled: 'Cancelada' };
-const typeLabels: Record<string, string> = { publish: 'Publicación', inventory: 'Inventario', price: 'Precio promo', theme_publish: 'Publicar tema' };
+const typeLabels: Record<string, string> = { publish: 'Publicación', inventory: 'Inventario', price: 'Precio promo', theme_publish: 'Publicar tema',
+  price_batch: 'Precio promo (lote)', inventory_batch: 'Inventario (lote)', publish_batch: 'Publicar (lote)' };
 
 function toIso(datetimeLocal: string): string {
   return new Date(datetimeLocal).toISOString();
@@ -52,24 +54,47 @@ export default function SchedulerPage() {
   const [syncMsg, setSyncMsg] = useState('');
   const [tasks, setTasks] = useState<Task[]>([]);
 
-  const [modal, setModal] = useState<null | 'publish' | 'inventory' | 'price' | 'csv'>(null);
+  const [modal, setModal] = useState<null | 'publish' | 'inventory' | 'price' | 'csv' | 'detail'>(null);
   const [publishRunAt, setPublishRunAt] = useState('');
   const [invMode, setInvMode] = useState<'add' | 'set'>('add');
   const [invRunAt, setInvRunAt] = useState('');
   const [invQty, setInvQty] = useState<Record<number, string>>({});
   const [priceStart, setPriceStart] = useState('');
   const [priceEnd, setPriceEnd] = useState('');
-  const [priceVals, setPriceVals] = useState<Record<number, { promo: string; compare: string }>>({});
+  const [priceVals, setPriceVals] = useState<Record<number, { promo?: string; compare?: string }>>({});
+  const [bulkQty, setBulkQty] = useState('');
+  const [search, setSearch] = useState('');
+  const [groupVals, setGroupVals] = useState<Record<number, { promo?: string; compare?: string }>>({});
+  const [groupQty, setGroupQty] = useState<Record<number, string>>({});
+  const [detail, setDetail] = useState<{ task: any; items: any[] } | null>(null);
+  const [bulkPromo, setBulkPromo] = useState('');
+  const [bulkCompare, setBulkCompare] = useState('');
   const [csvText, setCsvText] = useState('');
-  const [csvResult, setCsvResult] = useState<{ dryRun: boolean; action?: string; created: number; skipped: number; errors: { row: number; error: string }[]; preview: string[] } | null>(null);
+  const [csvResult, setCsvResult] = useState<{ dryRun: boolean; action?: string; hint?: string; batches?: number; created: number; skipped: number; errors: { row: number; error: string }[]; preview: string[] } | null>(null);
   const [csvAction, setCsvAction] = useState<'auto' | 'price' | 'inventory' | 'publish'>('auto');
   const [csvRunAt, setCsvRunAt] = useState('');
   const [csvRevertAt, setCsvRevertAt] = useState('');
   const [csvMode, setCsvMode] = useState<'add' | 'set'>('add');
   const [csvBusy, setCsvBusy] = useState(false);
 
-  const variantById = new Map<number, Variant & { productTitle: string }>();
-  products.forEach(p => p.variants.forEach(v => variantById.set(v.id, { ...v, productTitle: p.title })));
+  const variantById = new Map<number, Variant & { productTitle: string; productCacheId: number }>();
+  products.forEach(p => p.variants.forEach(v => variantById.set(v.id, { ...v, productTitle: p.title, productCacheId: p.id })));
+
+  // Búsqueda sobre la lista de productos (nombre o handle)
+  const q = search.trim().toLowerCase();
+  const visibleProducts = q ? products.filter(p => p.title.toLowerCase().includes(q) || (p.handle || '').toLowerCase().includes(q)) : products;
+  const allVisibleSelected = visibleProducts.length > 0 && visibleProducts.every(p => selectedProducts.has(p.id));
+
+  // Variantes seleccionadas agrupadas por producto (para editar un producto completo de una vez)
+  const selectedGroups = (() => {
+    const m = new Map<number, number[]>();
+    for (const id of selectedVariants) {
+      const v = variantById.get(id);
+      if (v) m.set(v.productCacheId, [...(m.get(v.productCacheId) ?? []), id]);
+    }
+    return [...m.entries()].map(([pid, ids]) => ({ pid, ids, title: variantById.get(ids[0])!.productTitle }));
+  })();
+  const selectedIds = selectedGroups.flatMap(g => g.ids);
 
   const csvEffective: 'price' | 'inventory' | 'publish' | null = csvAction === 'auto' ? sniffCsvAction(csvText) : csvAction;
 
@@ -78,6 +103,9 @@ export default function SchedulerPage() {
     setLocationId('');
     setLocations([]);
     setProducts([]);
+    setSelectedProducts(new Set());
+    setSelectedVariants(new Set());
+    setSearch('');
     setThemes([]);
     setThemeId('');
     setThemesMsg('');
@@ -135,8 +163,16 @@ export default function SchedulerPage() {
     if (res.ok) loadProducts(storeKey);
   }
 
-  function toggleProduct(id: number) {
-    setSelectedProducts(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  // Marcar un producto marca todas sus variantes (puedes desmarcar alguna después).
+  function toggleProduct(p: Product) {
+    const on = !selectedProducts.has(p.id);
+    setSelectedProducts(prev => { const n = new Set(prev); on ? n.add(p.id) : n.delete(p.id); return n; });
+    setSelectedVariants(prev => { const n = new Set(prev); p.variants.forEach(v => (on ? n.add(v.id) : n.delete(v.id))); return n; });
+  }
+  function toggleAllVisible() {
+    const on = !allVisibleSelected;
+    setSelectedProducts(prev => { const n = new Set(prev); visibleProducts.forEach(p => (on ? n.add(p.id) : n.delete(p.id))); return n; });
+    setSelectedVariants(prev => { const n = new Set(prev); visibleProducts.forEach(p => p.variants.forEach(v => (on ? n.add(v.id) : n.delete(v.id)))); return n; });
   }
   function toggleVariant(id: number) {
     setSelectedVariants(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -151,14 +187,43 @@ export default function SchedulerPage() {
     finishSchedule(res);
   }
 
+  function openInventoryModal() { setInvQty({}); setGroupQty({}); setBulkQty(''); setModal('inventory'); }
+  function openPriceModal() { setPriceVals({}); setGroupVals({}); setBulkPromo(''); setBulkCompare(''); setModal('price'); }
+
+  // Un campo por producto: llena todas sus variantes (cada una se puede ajustar después).
+  function setGroupQtyFor(pid: number, ids: number[], value: string) {
+    setGroupQty(prev => ({ ...prev, [pid]: value }));
+    setInvQty(prev => { const n = { ...prev }; for (const id of ids) { if (value === '') delete n[id]; else n[id] = value; } return n; });
+  }
+  function setGroupPrice(pid: number, ids: number[], field: 'promo' | 'compare', value: string) {
+    setGroupVals(prev => ({ ...prev, [pid]: { ...prev[pid], [field]: value } }));
+    setPriceVals(prev => { const n = { ...prev }; for (const id of ids) n[id] = { ...n[id], [field]: value === '' ? undefined : value }; return n; });
+  }
+  function applyBulkQty() { for (const g of selectedGroups) setGroupQtyFor(g.pid, g.ids, bulkQty); }
+  function applyBulkPrice() {
+    for (const g of selectedGroups) {
+      if (bulkPromo) setGroupPrice(g.pid, g.ids, 'promo', bulkPromo);
+      if (bulkCompare) setGroupPrice(g.pid, g.ids, 'compare', bulkCompare);
+    }
+  }
+
+  async function openDetail(id: number) {
+    const res = await fetch(`/api/scheduler/tasks/detail?id=${id}`).then(r => r.json());
+    if (res.ok) { setDetail({ task: res.task, items: res.items }); setModal('detail'); }
+    else alert('Error: ' + res.error);
+  }
+
+  const labelOf = (id: number) => `${variantById.get(id)?.productTitle} — ${variantById.get(id)?.title || 'Default Title'}`;
+  const listNames = (names: string[]) => names.slice(0, 5).join(', ') + (names.length > 5 ? ` y ${names.length - 5} más` : '');
+
   async function submitInventory() {
     if (!invRunAt) return alert('Selecciona fecha y hora.');
-    const items = [...selectedVariants].map(id => ({
-      variantCacheId: id,
-      label: `${variantById.get(id)?.productTitle} — ${variantById.get(id)?.title || 'Default Title'}`,
-      quantity: parseInt(invQty[id] || '0', 10),
+    // Si no tocaste el campo, vale el 10 que se muestra por defecto.
+    const items = selectedIds.map(id => ({
+      variantCacheId: id, label: labelOf(id), quantity: parseInt(invQty[id] ?? '10', 10),
     }));
-    if (items.some(i => !i.quantity || i.quantity <= 0)) return alert('Falta cantidad válida en alguna variante.');
+    const bad = items.filter(i => !i.quantity || i.quantity <= 0).map(i => i.label);
+    if (bad.length) return alert('Falta una cantidad válida en: ' + listNames(bad));
     const res = await fetch('/api/scheduler/tasks', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'schedule_inventory', storeKey, runAt: toIso(invRunAt), mode: invMode, locationId, items }),
@@ -169,18 +234,33 @@ export default function SchedulerPage() {
   async function submitPrice() {
     if (!priceStart || !priceEnd) return alert('Completa las fechas de inicio y fin.');
     if (new Date(priceEnd) <= new Date(priceStart)) return alert('La fecha de fin debe ser posterior a la de inicio.');
-    const items = [...selectedVariants].map(id => ({
+    // El tachado, si no lo tocaste, vale el precio actual que se muestra por defecto.
+    const items = selectedIds.map(id => ({
       variantCacheId: id,
-      label: `${variantById.get(id)?.productTitle} — ${variantById.get(id)?.title || 'Default Title'}`,
-      promoPrice: parseFloat(priceVals[id]?.promo || '0'),
-      compareAtPrice: parseFloat(priceVals[id]?.compare || '0'),
+      label: labelOf(id),
+      promoPrice: parseFloat(priceVals[id]?.promo ?? ''),
+      compareAtPrice: parseFloat(priceVals[id]?.compare ?? String(variantById.get(id)?.price ?? '')),
     }));
-    if (items.some(i => !i.promoPrice || !i.compareAtPrice)) return alert('Falta precio promocional o tachado en alguna variante.');
+    const noPromo = items.filter(i => !i.promoPrice || i.promoPrice <= 0).map(i => i.label);
+    if (noPromo.length) return alert('Falta el precio promocional en: ' + listNames(noPromo));
+    const noCompare = items.filter(i => !i.compareAtPrice || i.compareAtPrice <= 0).map(i => i.label);
+    if (noCompare.length) return alert('Falta el precio tachado en: ' + listNames(noCompare));
+    const odd = items.filter(i => i.promoPrice >= i.compareAtPrice).map(i => i.label);
+    if (odd.length && !confirm(`${odd.length} variante(s) tienen el precio promo igual o mayor al tachado (${listNames(odd)}). ¿Continuar?`)) return;
     const res = await fetch('/api/scheduler/tasks', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'schedule_price', storeKey, runAt: toIso(priceStart), revertAt: toIso(priceEnd), items }),
     }).then(r => r.json());
     finishSchedule(res);
+  }
+
+  async function retryTask(id?: number) {
+    const res = await fetch('/api/scheduler/tasks/retry', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(id ? { taskId: id } : {}),
+    }).then(r => r.json());
+    if (res.ok) { alert(`${res.retried} tarea(s) vuelven a pendiente. El cron las toma en la siguiente corrida (cada 5 minutos).`); loadTasks(); }
+    else alert('Error: ' + res.error);
   }
 
   async function submitCsv(dryRun: boolean) {
@@ -252,7 +332,7 @@ export default function SchedulerPage() {
   function finishSchedule(res: any) {
     if (res.ok) {
       setModal(null);
-      let msg = `${res.created} tarea(s) programada(s).`;
+      let msg = res.batches ? `Se programó ${res.batches} tarea con ${res.created} cambio(s) adentro.` : `${res.created} tarea(s) programada(s).`;
       if (res.errors?.length) msg += ` ${res.errors.length} con error: ${res.errors.join(', ')}`;
       alert(msg);
       loadTasks();
@@ -341,20 +421,26 @@ export default function SchedulerPage() {
         <div className="flex items-center gap-3 bg-white shadow rounded-lg p-4">
           <strong className="text-sm">{selectedProducts.size} producto(s), {selectedVariants.size} variante(s)</strong>
           <button onClick={() => selectedProducts.size ? setModal('publish') : alert('Selecciona al menos un producto.')} className="px-3 py-1.5 bg-black text-white rounded text-sm">Programar publicación</button>
-          <button onClick={() => selectedVariants.size ? setModal('inventory') : alert('Selecciona al menos una variante.')} className="px-3 py-1.5 bg-black text-white rounded text-sm">Programar inventario</button>
-          <button onClick={() => selectedVariants.size ? setModal('price') : alert('Selecciona al menos una variante.')} className="px-3 py-1.5 bg-black text-white rounded text-sm">Programar precio promo</button>
+          <button onClick={() => selectedVariants.size ? openInventoryModal() : alert('Selecciona al menos una variante.')} className="px-3 py-1.5 bg-black text-white rounded text-sm">Programar inventario</button>
+          <button onClick={() => selectedVariants.size ? openPriceModal() : alert('Selecciona al menos una variante.')} className="px-3 py-1.5 bg-black text-white rounded text-sm">Programar precio promo</button>
         </div>
       )}
 
+      <div className="flex items-center gap-3">
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar producto (nombre o handle)..."
+          className="border rounded px-3 py-1.5 text-sm w-72 bg-white" />
+        {search && <span className="text-xs text-gray-500">{visibleProducts.length} de {products.length} producto(s)</span>}
+      </div>
       <table className="w-full bg-white shadow rounded-lg text-sm">
         <thead className="bg-gray-50">
-          <tr><th className="p-2 text-left">Publicar</th><th className="p-2 text-left">Imagen</th><th className="p-2 text-left">Producto</th><th className="p-2 text-left">Estado</th><th className="p-2 text-left">Variantes</th></tr>
+          <tr><th className="p-2 text-left"><label className="inline-flex items-center gap-1"><input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible} /> Todos</label></th><th className="p-2 text-left">Imagen</th><th className="p-2 text-left">Producto</th><th className="p-2 text-left">Estado</th><th className="p-2 text-left">Variantes</th></tr>
         </thead>
         <tbody>
           {products.length === 0 && <tr><td colSpan={5} className="p-3 text-gray-500">Selecciona tienda y sucursal, luego sincroniza.</td></tr>}
-          {products.map(p => (
+          {products.length > 0 && visibleProducts.length === 0 && <tr><td colSpan={5} className="p-3 text-gray-500">Ningún producto coincide con la búsqueda.</td></tr>}
+          {visibleProducts.map(p => (
             <tr key={p.id} className="border-t">
-              <td className="p-2"><input type="checkbox" checked={selectedProducts.has(p.id)} onChange={() => toggleProduct(p.id)} /></td>
+              <td className="p-2"><input type="checkbox" checked={selectedProducts.has(p.id)} onChange={() => toggleProduct(p)} /></td>
               <td className="p-2">{p.image_url && <img src={p.image_url} className="w-11 h-11 object-cover rounded" />}</td>
               <td className="p-2">{p.title}</td>
               <td className="p-2">{p.status}</td>
@@ -375,7 +461,14 @@ export default function SchedulerPage() {
         </tbody>
       </table>
 
-      <h2 className="text-xl font-bold">Tareas programadas</h2>
+      <div className="flex items-center gap-3">
+        <h2 className="text-xl font-bold">Tareas programadas</h2>
+        {tasks.some(t => t.status === 'failed') && (
+          <button onClick={() => retryTask()} className="px-3 py-1.5 bg-amber-600 text-white rounded text-xs">
+            Reintentar fallidas ({tasks.filter(t => t.status === 'failed').length})
+          </button>
+        )}
+      </div>
       <table className="w-full bg-white shadow rounded-lg text-sm">
         <thead className="bg-gray-50">
           <tr><th className="p-2 text-left">Tienda</th><th className="p-2 text-left">Tipo</th><th className="p-2 text-left">Producto</th><th className="p-2 text-left">Origen</th><th className="p-2 text-left">Ejecuta</th><th className="p-2 text-left">Revierte</th><th className="p-2 text-left">Estado</th><th className="p-2 text-left">Error</th><th></th></tr>
@@ -392,7 +485,11 @@ export default function SchedulerPage() {
               <td className="p-2">{t.revert_at || '—'}</td>
               <td className="p-2">{statusLabels[t.status] || t.status}</td>
               <td className="p-2 text-red-600 text-xs max-w-[200px]">{t.last_error}</td>
-              <td className="p-2">{['pending', 'active'].includes(t.status) && <button onClick={() => doCancelTask(t.id)} className="px-2 py-1 bg-red-600 text-white rounded text-xs">Cancelar</button>}</td>
+              <td className="p-2 flex gap-1">
+                {['pending', 'active'].includes(t.status) && <button onClick={() => doCancelTask(t.id)} className="px-2 py-1 bg-red-600 text-white rounded text-xs">Cancelar</button>}
+                {t.item_count ? <button onClick={() => openDetail(t.id)} className="px-2 py-1 bg-gray-200 rounded text-xs">Detalle</button> : null}
+                {t.status === 'failed' && <button onClick={() => retryTask(t.id)} className="px-2 py-1 bg-amber-600 text-white rounded text-xs">Reintentar</button>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -409,21 +506,41 @@ export default function SchedulerPage() {
 
       {modal === 'inventory' && (
         <Modal onClose={() => setModal(null)} title="Programar inventario" wide>
-          <p className="text-xs text-gray-500 mb-2">Cantidad individual por variante. Modo y fecha aplican a todas.</p>
+          <p className="text-xs text-gray-500 mb-2">Escribe la cantidad en la fila del producto para llenar todas sus variantes, o ajusta una por una. Se programa UNA sola tarea con todo. Modo y fecha aplican a todas.</p>
+          <div className="flex items-end gap-2 mb-2 text-xs">
+            <label>Cantidad para todas
+              <input type="number" min={1} value={bulkQty} onChange={e => setBulkQty(e.target.value)} className="block w-24 border rounded px-1 py-0.5 mt-1" />
+            </label>
+            <button type="button" disabled={!bulkQty}
+              onClick={applyBulkQty}
+              className="px-2 py-1 bg-gray-200 rounded disabled:opacity-40">Aplicar a todas</button>
+          </div>
           <div className="max-h-64 overflow-y-auto border rounded mb-3">
             <table className="w-full text-xs">
               <thead><tr className="bg-gray-50"><th className="p-1 text-left">Variante</th><th className="p-1 text-left">Stock actual</th><th className="p-1 text-left">Cantidad</th></tr></thead>
               <tbody>
-                {[...selectedVariants].map(id => {
-                  const v = variantById.get(id)!;
-                  return (
-                    <tr key={id} className="border-t">
-                      <td className="p-1">{v.productTitle} — {v.title || 'Default Title'}</td>
-                      <td className="p-1">{v.inventory_qty}</td>
-                      <td className="p-1"><input type="number" min={1} defaultValue={10} onChange={e => setInvQty(prev => ({ ...prev, [id]: e.target.value }))} className="w-20 border rounded px-1 py-0.5" /></td>
+                {selectedGroups.map(g => (
+                  <Fragment key={g.pid}>
+                    <tr className="bg-gray-100 border-t">
+                      <td className="p-1 font-semibold">{g.title} <span className="font-normal text-gray-500">({g.ids.length} variantes)</span></td>
+                      <td className="p-1" />
+                      <td className="p-1">
+                        <input type="number" min={1} placeholder="todas" value={groupQty[g.pid] ?? ''}
+                          onChange={e => setGroupQtyFor(g.pid, g.ids, e.target.value)} className="w-20 border rounded px-1 py-0.5" />
+                      </td>
                     </tr>
-                  );
-                })}
+                    {g.ids.map(id => {
+                      const v = variantById.get(id)!;
+                      return (
+                        <tr key={id} className="border-t">
+                          <td className="p-1 pl-4">{v.title || 'Default Title'}</td>
+                          <td className="p-1">{v.inventory_qty}</td>
+                          <td className="p-1"><input type="number" min={1} value={invQty[id] ?? '10'} onChange={e => setInvQty(prev => ({ ...prev, [id]: e.target.value }))} className="w-20 border rounded px-1 py-0.5" /></td>
+                        </tr>
+                      );
+                    })}
+                  </Fragment>
+                ))}
               </tbody>
             </table>
           </div>
@@ -442,22 +559,49 @@ export default function SchedulerPage() {
 
       {modal === 'price' && (
         <Modal onClose={() => setModal(null)} title="Programar precio promo" wide>
-          <p className="text-xs text-gray-500 mb-2">Precio individual por variante. Fechas aplican a todas.</p>
+          <p className="text-xs text-gray-500 mb-2">Escribe el precio en la fila del producto para llenar todas sus variantes, o ajusta una por una. El tachado viene con el precio actual. Se programa UNA sola tarea con todo; las fechas aplican a todas.</p>
+          <div className="flex items-end gap-2 mb-2 text-xs flex-wrap">
+            <label>Promo para todas
+              <input type="number" step="0.01" value={bulkPromo} onChange={e => setBulkPromo(e.target.value)} className="block w-24 border rounded px-1 py-0.5 mt-1" />
+            </label>
+            <label>Tachado para todas (opcional)
+              <input type="number" step="0.01" value={bulkCompare} onChange={e => setBulkCompare(e.target.value)} className="block w-24 border rounded px-1 py-0.5 mt-1" />
+            </label>
+            <button type="button" disabled={!bulkPromo && !bulkCompare}
+              onClick={applyBulkPrice}
+              className="px-2 py-1 bg-gray-200 rounded disabled:opacity-40">Aplicar a todas</button>
+          </div>
           <div className="max-h-64 overflow-y-auto border rounded mb-3">
             <table className="w-full text-xs">
               <thead><tr className="bg-gray-50"><th className="p-1 text-left">Variante</th><th className="p-1 text-left">Actual</th><th className="p-1 text-left">Promo</th><th className="p-1 text-left">Tachado</th></tr></thead>
               <tbody>
-                {[...selectedVariants].map(id => {
-                  const v = variantById.get(id)!;
-                  return (
-                    <tr key={id} className="border-t">
-                      <td className="p-1">{v.productTitle} — {v.title || 'Default Title'}</td>
-                      <td className="p-1">${v.price}</td>
-                      <td className="p-1"><input type="number" step="0.01" placeholder="ej. 79.00" onChange={e => setPriceVals(prev => ({ ...prev, [id]: { ...prev[id], promo: e.target.value } }))} className="w-20 border rounded px-1 py-0.5" /></td>
-                      <td className="p-1"><input type="number" step="0.01" defaultValue={v.price} onChange={e => setPriceVals(prev => ({ ...prev, [id]: { ...prev[id], compare: e.target.value } }))} className="w-20 border rounded px-1 py-0.5" /></td>
+                {selectedGroups.map(g => (
+                  <Fragment key={g.pid}>
+                    <tr className="bg-gray-100 border-t">
+                      <td className="p-1 font-semibold">{g.title} <span className="font-normal text-gray-500">({g.ids.length} variantes)</span></td>
+                      <td className="p-1" />
+                      <td className="p-1">
+                        <input type="number" step="0.01" placeholder="todas" value={groupVals[g.pid]?.promo ?? ''}
+                          onChange={e => setGroupPrice(g.pid, g.ids, 'promo', e.target.value)} className="w-20 border rounded px-1 py-0.5" />
+                      </td>
+                      <td className="p-1">
+                        <input type="number" step="0.01" placeholder="actual" value={groupVals[g.pid]?.compare ?? ''}
+                          onChange={e => setGroupPrice(g.pid, g.ids, 'compare', e.target.value)} className="w-20 border rounded px-1 py-0.5" />
+                      </td>
                     </tr>
-                  );
-                })}
+                    {g.ids.map(id => {
+                      const v = variantById.get(id)!;
+                      return (
+                        <tr key={id} className="border-t">
+                          <td className="p-1 pl-4">{v.title || 'Default Title'}</td>
+                          <td className="p-1">${v.price}</td>
+                          <td className="p-1"><input type="number" step="0.01" placeholder="ej. 79.00" value={priceVals[id]?.promo ?? ''} onChange={e => setPriceVals(prev => ({ ...prev, [id]: { ...prev[id], promo: e.target.value } }))} className="w-20 border rounded px-1 py-0.5" /></td>
+                          <td className="p-1"><input type="number" step="0.01" value={priceVals[id]?.compare ?? String(v.price)} onChange={e => setPriceVals(prev => ({ ...prev, [id]: { ...prev[id], compare: e.target.value } }))} className="w-20 border rounded px-1 py-0.5" /></td>
+                        </tr>
+                      );
+                    })}
+                  </Fragment>
+                ))}
               </tbody>
             </table>
           </div>
@@ -468,6 +612,39 @@ export default function SchedulerPage() {
             <input type="datetime-local" value={priceEnd} onChange={e => setPriceEnd(e.target.value)} className="block border rounded px-2 py-1 mt-1 w-full" />
           </label>
           <ModalActions onCancel={() => setModal(null)} onSubmit={submitPrice} />
+        </Modal>
+      )}
+
+      {modal === 'detail' && detail && (
+        <Modal onClose={() => setModal(null)} title={detail.task.label || 'Detalle de la tarea'} wide>
+          <p className="text-xs text-gray-500 mb-2">
+            Estado: {statusLabels[detail.task.status] || detail.task.status}
+            {detail.task.mode ? ` · Modo: ${detail.task.mode === 'set' ? 'fijar' : 'sumar'}` : ''}
+            {detail.task.end_mode ? ` · Al terminar: ${detail.task.end_mode === 'compare_to_price' ? 'el precio de comparación pasa a ser el precio real' : 'vuelve al precio anterior'}` : ''}
+            {detail.task.pending_blocks ? ` · Pendiente de aplicar: ${detail.task.pending_blocks} bloque(s)` : ''}
+          </p>
+          {detail.task.last_error && <p className="text-xs text-red-600 mb-2">{detail.task.last_error}</p>}
+          <div className="max-h-72 overflow-y-auto border rounded mb-3">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-gray-50">
+                  <th className="p-1 text-left">{detail.task.type === 'publish_batch' ? 'Producto' : 'Variante'}</th>
+                  {detail.task.type === 'price_batch' && <><th className="p-1 text-left">Promo</th><th className="p-1 text-left">Tachado</th></>}
+                  {detail.task.type === 'inventory_batch' && <th className="p-1 text-left">Cantidad</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {detail.items.map((i: any, k: number) => (
+                  <tr key={k} className="border-t">
+                    <td className="p-1">{i.label}</td>
+                    {detail.task.type === 'price_batch' && <><td className="p-1">${i.promo_price}</td><td className="p-1">${i.compare_at_price}</td></>}
+                    {detail.task.type === 'inventory_batch' && <td className="p-1">{i.quantity}</td>}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex justify-end"><button onClick={() => setModal(null)} className="px-3 py-1.5 bg-gray-200 rounded text-sm">Cerrar</button></div>
         </Modal>
       )}
 
@@ -550,9 +727,10 @@ export default function SchedulerPage() {
           {csvResult && (
             <div className="text-xs mb-3 bg-gray-50 border rounded p-2 max-h-40 overflow-y-auto">
               <p className="font-semibold">
-                {csvResult.dryRun ? `Revisión: se crearían ${csvResult.created} tarea(s).` : `${csvResult.created} tarea(s) programada(s).`}
+                {csvResult.dryRun ? `Revisión: ${csvResult.created} cambio(s) en ${csvResult.batches ?? 1} tarea(s) (una por acción).` : `Se programó ${csvResult.batches ?? 1} tarea con ${csvResult.created} cambio(s) adentro.`}
                 {csvResult.skipped ? ` ${csvResult.skipped} fila(s) omitida(s) (sin valor o repetidas).` : ''}
               </p>
+              {csvResult.hint && <p className="text-amber-700 my-1">{csvResult.hint}</p>}
               {csvResult.preview.map((l, i) => <p key={i} className="text-gray-600">· {l}</p>)}
               {csvResult.errors.map((e, i) => <p key={i} className="text-red-600">Fila {e.row}: {e.error}</p>)}
             </div>

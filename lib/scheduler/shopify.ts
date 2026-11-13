@@ -15,6 +15,32 @@ export function cleanDomain(domain: string): string {
   return domain.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
 }
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Shopify limita las llamadas REST (2 por segundo sostenido, con un "cubo" de 40 de ráfaga).
+ * - Si responde 429, espera lo que indica Retry-After y reintenta (hasta 6 veces).
+ * - Si el cubo está casi lleno (header X-Shopify-Shop-Api-Call-Limit, ej. "38/40"), hace una
+ *   pausa corta para no llegar al 429 en la siguiente llamada.
+ */
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, init);
+    if (res.status !== 429 || attempt >= 6) {
+      if (res.status !== 429) {
+        const limit = res.headers.get('x-shopify-shop-api-call-limit');
+        if (limit) {
+          const [used, cap] = limit.split('/').map(Number);
+          if (cap && used >= cap - 4) await sleep(600);
+        }
+      }
+      return res;
+    }
+    const retryAfter = Number(res.headers.get('retry-after')) || 1;
+    await sleep(Math.min(retryAfter, 10) * 1000 + attempt * 250);
+  }
+}
+
 async function shopifyRequest(
   store: Store,
   method: string,
@@ -25,9 +51,9 @@ async function shopifyRequest(
     throw new Error(`La tienda '${store.name}' todavía no está conectada. Ve a "Tiendas" y dale clic en "Conectar".`);
   }
   const domain = cleanDomain(store.domain);
-  const url = `https://${domain}/admin/api/${store.api_version}${path}`;
+  const url = `${baseUrl(domain)}/admin/api/${store.api_version}${path}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method,
     headers: {
       'X-Shopify-Access-Token': store.access_token,
@@ -92,29 +118,141 @@ export async function shopifyListLocations(store: Store) {
 // y una api_version reciente (2024-10 o mayor) en la tienda.
 // ---------------------------------------------------------
 
+/** Solo para pruebas locales: apunta las llamadas a un servidor simulado en vez de Shopify. */
+function baseUrl(domain: string) {
+  return process.env.SHOPIFY_TEST_BASE || `https://${domain}`;
+}
+
+export const gid = (type: 'Product' | 'ProductVariant' | 'InventoryItem' | 'Location', id: string | number) =>
+  `gid://shopify/${type}/${id}`;
+const idOf = (g: string) => String(g).split('/').pop() as string;
+
 async function shopifyGraphql(store: Store, query: string, variables: Record<string, unknown> = {}) {
   if (!store.access_token) {
     throw new Error(`La tienda '${store.name}' todavía no está conectada. Ve a "Tiendas" y dale clic en "Conectar".`);
   }
   const domain = cleanDomain(store.domain);
-  const res = await fetch(`https://${domain}/admin/api/${store.api_version}/graphql.json`, {
-    method: 'POST',
-    headers: { 'X-Shopify-Access-Token': store.access_token, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, variables }),
-  });
-  if (res.status === 401) {
-    throw new Error(`Token inválido o vencido para ${domain}. Reconecta la tienda.`);
-  }
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`Shopify GraphQL error ${res.status}: ${JSON.stringify(json)}`);
-  if (json.errors?.length) {
-    const msg = JSON.stringify(json.errors);
-    if (/access denied|scope|themes/i.test(msg)) {
-      throw new Error(`Sin permiso para temas (falta read_themes/write_themes: reconecta la tienda). Detalle: ${msg}`);
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetchWithRetry(`${baseUrl(domain)}/admin/api/${store.api_version}/graphql.json`, {
+      method: 'POST',
+      headers: { 'X-Shopify-Access-Token': store.access_token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, variables }),
+    });
+    if (res.status === 401) {
+      throw new Error(`Token inválido o vencido para ${domain}. Reconecta la tienda.`);
     }
-    throw new Error(`Shopify GraphQL: ${msg}`);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Shopify GraphQL error ${res.status}: ${JSON.stringify(json)}`);
+    if (json.errors?.length) {
+      // GraphQL limita por "costo": si se llena el cupo responde THROTTLED; se espera y se reintenta.
+      const throttled = json.errors.some((e: any) => e?.extensions?.code === 'THROTTLED');
+      if (throttled && attempt < 5) { await sleep(1000 + attempt * 500); continue; }
+      const msg = JSON.stringify(json.errors);
+      if (/access denied|scope|themes/i.test(msg)) {
+        throw new Error(`Sin permiso (falta un scope: reconecta la tienda). Detalle: ${msg}`);
+      }
+      throw new Error(`Shopify GraphQL: ${msg}`);
+    }
+    return json.data;
   }
-  return json.data;
+}
+
+function throwUserErrors(name: string, errors: { message: string }[] | undefined | null) {
+  if (errors?.length) throw new Error(`${name}: ${errors.map(e => e.message).join('; ')}`);
+}
+
+// ---------------------------------------------------------
+// Operaciones por lote (GraphQL): muchas variantes/productos en pocas llamadas
+// ---------------------------------------------------------
+
+/** Precio y tachado actuales de muchas variantes (100 por llamada). */
+export async function shopifyReadVariantPrices(store: Store, variantIds: string[]) {
+  const out: Record<string, { price: string; compare: string | null }> = {};
+  for (let i = 0; i < variantIds.length; i += 100) {
+    const ids = variantIds.slice(i, i + 100).map(v => gid('ProductVariant', v));
+    const data = await shopifyGraphql(
+      store,
+      `query($ids: [ID!]!) { nodes(ids: $ids) { ... on ProductVariant { id price compareAtPrice } } }`,
+      { ids }
+    );
+    for (const n of data.nodes ?? []) {
+      if (n?.id) out[idOf(n.id)] = { price: n.price, compare: n.compareAtPrice ?? null };
+    }
+  }
+  return out;
+}
+
+/** Cambia precio y precio de comparación de TODAS las variantes de un producto en una sola llamada. */
+export async function shopifyUpdateVariantPricesBulk(
+  store: Store, productId: string,
+  variants: { variantId: string; price: string; compareAtPrice: string | null }[]
+) {
+  const data = await shopifyGraphql(
+    store,
+    `mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+       productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+         productVariants { id price compareAtPrice }
+         userErrors { field message code }
+       }
+     }`,
+    {
+      productId: gid('Product', productId),
+      variants: variants.map(v => ({ id: gid('ProductVariant', v.variantId), price: v.price, compareAtPrice: v.compareAtPrice })),
+    }
+  );
+  throwUserErrors('productVariantsBulkUpdate', data.productVariantsBulkUpdate?.userErrors);
+}
+
+/** Suma (o resta) inventario de muchas variantes en una sola llamada. */
+export async function shopifyInventoryAdjustBulk(
+  store: Store, locationId: string, changes: { inventoryItemId: string; delta: number }[]
+) {
+  const data = await shopifyGraphql(
+    store,
+    `mutation($input: InventoryAdjustQuantitiesInput!) {
+       inventoryAdjustQuantities(input: $input) { inventoryAdjustmentGroup { id } userErrors { field message code } }
+     }`,
+    {
+      input: {
+        reason: 'correction', name: 'available',
+        changes: changes.map(c => ({ delta: c.delta, inventoryItemId: gid('InventoryItem', c.inventoryItemId), locationId: gid('Location', locationId) })),
+      },
+    }
+  );
+  throwUserErrors('inventoryAdjustQuantities', data.inventoryAdjustQuantities?.userErrors);
+}
+
+/** Fija el inventario de muchas variantes en una sola llamada. */
+export async function shopifyInventorySetBulk(
+  store: Store, locationId: string, quantities: { inventoryItemId: string; quantity: number }[]
+) {
+  const data = await shopifyGraphql(
+    store,
+    `mutation($input: InventorySetQuantitiesInput!) {
+       inventorySetQuantities(input: $input) { inventoryAdjustmentGroup { id } userErrors { field message code } }
+     }`,
+    {
+      input: {
+        reason: 'correction', name: 'available', ignoreCompareQuantity: true,
+        quantities: quantities.map(q => ({ inventoryItemId: gid('InventoryItem', q.inventoryItemId), locationId: gid('Location', locationId), quantity: q.quantity })),
+      },
+    }
+  );
+  throwUserErrors('inventorySetQuantities', data.inventorySetQuantities?.userErrors);
+}
+
+/** Publica (status ACTIVE) varios productos; las llamadas GraphQL van en paralelo. */
+export async function shopifyProductsActivate(store: Store, productIds: string[]) {
+  await Promise.all(productIds.map(async (id) => {
+    const data = await shopifyGraphql(
+      store,
+      `mutation($productId: ID!) {
+         productChangeStatus(productId: $productId, status: ACTIVE) { product { id status } userErrors { field message } }
+       }`,
+      { productId: gid('Product', id) }
+    );
+    throwUserErrors('productChangeStatus', data.productChangeStatus?.userErrors);
+  }));
 }
 
 export type ShopifyTheme = { id: string; name: string; role: string };

@@ -3,6 +3,8 @@ import {
   Store, shopifyListProducts, shopifySetProductStatus, shopifyGetVariant,
   shopifyUpdateVariantPrice, shopifyAdjustInventory, shopifySetInventory,
   shopifyListThemes, shopifyPublishTheme,
+  shopifyReadVariantPrices, shopifyUpdateVariantPricesBulk,
+  shopifyInventoryAdjustBulk, shopifyInventorySetBulk, shopifyProductsActivate,
 } from './shopify';
 
 // ---------------------------------------------------------
@@ -146,6 +148,15 @@ export async function findVariantBySku(storeKey: string, sku: string) {
   return rows[0] ?? null;
 }
 
+/** Cuántos productos hay sincronizados en la tienda y a cuántos ya se les guardó el handle. */
+export async function catalogStats(storeKey: string) {
+  const rows = await sql`
+    SELECT count(*)::int AS total, count(handle)::int AS with_handle
+    FROM products_cache WHERE store_key = ${storeKey}
+  `;
+  return { total: rows[0].total as number, withHandle: rows[0].with_handle as number };
+}
+
 /** Producto + todas sus variantes, buscado por handle (el que trae el CSV exportado de Shopify). */
 export async function findProductByHandle(storeKey: string, handle: string) {
   const products = await sql`
@@ -216,6 +227,54 @@ export async function listStoreThemes(storeKey: string) {
   return shopifyListThemes(store);
 }
 
+// ---------------------------------------------------------
+// Tareas de LOTE: una sola tarea con toda la lista de cambios
+// ---------------------------------------------------------
+
+export type PriceItem = { product_id: string; variant_id: string; label: string; promo_price: string; compare_at_price: string };
+export type InventoryItem = { product_id: string; variant_id: string; inventory_item_id: string; label: string; quantity: number };
+export type PublishItem = { product_id: string; label: string };
+
+const countProducts = (items: { product_id: string }[]) => new Set(items.map(i => i.product_id)).size;
+
+export async function createPriceBatchTask(
+  storeKey: string, items: PriceItem[], runAt: string, revertAt: string,
+  endMode: 'restore' | 'compare_to_price', source: 'manual' | 'csv' = 'manual'
+) {
+  const label = `Precio promo: ${items.length} variante(s) en ${countProducts(items)} producto(s)`;
+  const payload = JSON.stringify({ items, end_mode: endMode });
+  const rows = await sql`
+    INSERT INTO scheduled_tasks (store_key, type, label, payload, run_at, revert_at, source)
+    VALUES (${storeKey}, 'price_batch', ${label}, ${payload}::jsonb, ${runAt}, ${revertAt}, ${source})
+    RETURNING id`;
+  return rows[0].id as number;
+}
+
+export async function createInventoryBatchTask(
+  storeKey: string, items: InventoryItem[], runAt: string, mode: 'add' | 'set',
+  locationId: string | null, source: 'manual' | 'csv' = 'manual'
+) {
+  const label = `Inventario (${mode === 'set' ? 'fijar' : 'sumar'}): ${items.length} variante(s) en ${countProducts(items)} producto(s)`;
+  const payload = JSON.stringify({ items, mode });
+  const rows = await sql`
+    INSERT INTO scheduled_tasks (store_key, type, label, payload, run_at, location_id, source)
+    VALUES (${storeKey}, 'inventory_batch', ${label}, ${payload}::jsonb, ${runAt}, ${locationId}, ${source})
+    RETURNING id`;
+  return rows[0].id as number;
+}
+
+export async function createPublishBatchTask(
+  storeKey: string, items: PublishItem[], runAt: string, source: 'manual' | 'csv' = 'manual'
+) {
+  const label = `Publicar: ${items.length} producto(s)`;
+  const payload = JSON.stringify({ items });
+  const rows = await sql`
+    INSERT INTO scheduled_tasks (store_key, type, label, payload, run_at, source)
+    VALUES (${storeKey}, 'publish_batch', ${label}, ${payload}::jsonb, ${runAt}, ${source})
+    RETURNING id`;
+  return rows[0].id as number;
+}
+
 export async function cancelTask(taskId: number) {
   await sql`UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ${taskId} AND status IN ('pending','active')`;
 }
@@ -224,94 +283,250 @@ export async function cancelTask(taskId: number) {
 // Ejecutar tareas vencidas (cron)
 // ---------------------------------------------------------
 
-export async function runDueTasks(): Promise<{ ok: number; failed: number }> {
-  const summary = { ok: 0, failed: 0 };
+type BatchState = {
+  snapshot?: Record<string, { price: string; compare: string | null }>;
+  started?: boolean;
+  todo?: { start?: number[]; revert?: number[] };
+};
+
+function chunk<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+function groupByProduct<T extends { product_id: string }>(items: T[]): T[][] {
+  const m = new Map<string, T[]>();
+  for (const i of items) m.set(i.product_id, [...(m.get(i.product_id) ?? []), i]);
+  return [...m.values()];
+}
+
+/**
+ * Ejecuta una tarea de lote. El avance se guarda en original_data (lista de bloques pendientes):
+ * - si se acaba el tiempo de la corrida, devuelve 'deferred' y la siguiente corrida sigue donde se quedó;
+ * - si algún bloque falla, se queda en la lista y la tarea pasa a 'failed'; "Reintentar" solo repite esos bloques.
+ */
+async function runBatchTask(t: any, store: Store, deadline: number): Promise<'done' | 'deferred' | 'failed'> {
+  const payload = t.payload as any;
+  const state: BatchState = (t.original_data as BatchState | null) ?? {};
+  const save = () => sql`UPDATE scheduled_tasks SET original_data=${JSON.stringify(state)}::jsonb WHERE id=${t.id}`;
+
+  async function runPhase(phase: 'start' | 'revert', chunks: any[][], apply: (items: any[]) => Promise<void>) {
+    state.todo = state.todo ?? {};
+    const todo: number[] = state.todo[phase] ?? chunks.map((_, i) => i);
+    const stillTodo: number[] = [];
+    const errors: string[] = [];
+    let timedOut = false;
+    for (let k = 0; k < todo.length; k++) {
+      const idx = todo[k];
+      if (timedOut || Date.now() > deadline) { timedOut = true; stillTodo.push(idx); continue; }
+      try { await apply(chunks[idx]); } catch (e: any) { errors.push(e.message); stillTodo.push(idx); }
+      state.todo[phase] = [...stillTodo, ...todo.slice(k + 1)];
+      await save();
+    }
+    state.todo[phase] = stillTodo;
+    if (!stillTodo.length) delete state.todo[phase];
+    await save();
+    if (timedOut) return 'deferred' as const;
+    if (stillTodo.length) {
+      const msg = `${stillTodo.length} de ${chunks.length} bloque(s) fallaron: ${errors[0]}`;
+      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${msg} WHERE id=${t.id}`;
+      return 'failed' as const;
+    }
+    return 'done' as const;
+  }
+  const complete = () => sql`UPDATE scheduled_tasks SET status='completed', last_error=NULL WHERE id=${t.id}`;
+
+  if (t.type === 'publish_batch') {
+    const r = await runPhase('start', chunk(payload.items as any[], 10),
+      items => shopifyProductsActivate(store, items.map(i => i.product_id)));
+    if (r === 'done') await complete();
+    return r;
+  }
+
+  if (t.type === 'inventory_batch') {
+    const locationId = (t.location_id as string | null) || store.location_id;
+    if (!locationId) throw new Error('No hay location_id (ni en la tarea ni en la tienda).');
+    const r = await runPhase('start', chunk(payload.items as any[], 100), items =>
+      payload.mode === 'set'
+        ? shopifyInventorySetBulk(store, locationId, items.map(i => ({ inventoryItemId: i.inventory_item_id, quantity: i.quantity })))
+        : shopifyInventoryAdjustBulk(store, locationId, items.map(i => ({ inventoryItemId: i.inventory_item_id, delta: i.quantity }))));
+    if (r === 'done') await complete();
+    return r;
+  }
+
+  // price_batch
+  const groups = groupByProduct(payload.items as PriceItem[]);
+  if (t.status === 'pending') {
+    // 'restore': se respalda el precio actual de todas las variantes (una consulta por cada 100)
+    if (payload.end_mode !== 'compare_to_price' && !state.snapshot) {
+      state.snapshot = await shopifyReadVariantPrices(store, (payload.items as PriceItem[]).map(i => i.variant_id));
+      await save();
+    }
+    const r = await runPhase('start', groups, items =>
+      shopifyUpdateVariantPricesBulk(store, items[0].product_id,
+        items.map(i => ({ variantId: i.variant_id, price: i.promo_price, compareAtPrice: i.compare_at_price }))));
+    if (r === 'done') {
+      state.started = true;
+      await save();
+      await sql`UPDATE scheduled_tasks SET status='active' WHERE id=${t.id} AND status='pending'`;
+    }
+    return r;
+  }
+
+  // status 'active' y ya llegó la fecha de fin: termina la promo
+  const r = await runPhase('revert', groups, async (items) => {
+    const variants = items.map(i => {
+      if (payload.end_mode === 'compare_to_price') {
+        // el precio de comparación pasa a ser el precio real y se quita el tachado
+        return { variantId: i.variant_id, price: i.compare_at_price, compareAtPrice: null as string | null };
+      }
+      const snap = state.snapshot?.[i.variant_id];
+      return snap ? { variantId: i.variant_id, price: snap.price, compareAtPrice: snap.compare } : null;
+    }).filter(Boolean) as { variantId: string; price: string; compareAtPrice: string | null }[];
+    if (variants.length) await shopifyUpdateVariantPricesBulk(store, items[0].product_id, variants);
+  });
+  if (r === 'done') await complete();
+  return r;
+}
+
+/**
+ * Ejecuta las tareas vencidas. Trabaja con un presupuesto de tiempo (por defecto 50 s, para
+ * caber en el límite de la función en Vercel): lo que no alcance a procesar se queda
+ * "pendiente" y lo toma la siguiente corrida del cron (ver `deferred`).
+ */
+export async function runDueTasks(budgetMs = 50_000): Promise<{ ok: number; failed: number; deferred: number }> {
+  const summary = { ok: 0, failed: 0, deferred: 0 };
   const now = new Date().toISOString();
+  const deadline = Date.now() + budgetMs;
 
-  const publishRows = await sql`SELECT * FROM scheduled_tasks WHERE type='publish' AND status='pending' AND run_at <= ${now}`;
-  for (const t of publishRows) {
+  // Una consulta de tienda por corrida (no una por tarea)
+  const storeCache = new Map<string, Store>();
+  const storeFor = async (key: string) => {
+    if (!storeCache.has(key)) storeCache.set(key, await getStore(key));
+    return storeCache.get(key)!;
+  };
+
+  async function run(rows: any[], fn: (t: any) => Promise<void>) {
+    for (const t of rows) {
+      if (Date.now() > deadline) { summary.deferred++; continue; }
+      try {
+        await fn(t);
+        summary.ok++;
+      } catch (e: any) {
+        await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
+        summary.failed++;
+      }
+    }
+  }
+
+  // Primero lo más urgente y barato: el tema (1 llamada) y las publicaciones.
+  const themeRows = await sql`SELECT * FROM scheduled_tasks WHERE type='theme_publish' AND status='pending' AND run_at <= ${now} ORDER BY run_at`;
+  await run(themeRows, async (t) => {
+    const store = await storeFor(t.store_key as string);
+    const payload = t.payload as { theme_id: string; theme_name: string };
+    await shopifyPublishTheme(store, payload.theme_id);
+    await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
+  });
+
+  // Lotes: UNA tarea con muchos cambios (precio, inventario o publicar).
+  const batchRows = await sql`
+    SELECT * FROM scheduled_tasks
+    WHERE (type IN ('publish_batch','inventory_batch','price_batch') AND status='pending' AND run_at <= ${now})
+       OR (type = 'price_batch' AND status='active' AND revert_at IS NOT NULL AND revert_at <= ${now})
+    ORDER BY run_at`;
+  for (const t of batchRows) {
+    if (Date.now() > deadline) { summary.deferred++; continue; }
     try {
-      const store = await getStore(t.store_key as string);
-      await shopifySetProductStatus(store, String(t.product_id), 'active');
-      await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
-      summary.ok++;
+      const store = await storeFor(t.store_key as string);
+      const r = await runBatchTask(t, store, deadline);
+      if (r === 'done') summary.ok++;
+      else if (r === 'deferred') summary.deferred++;
+      else summary.failed++;
     } catch (e: any) {
       await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
       summary.failed++;
     }
   }
 
-  const invRows = await sql`SELECT * FROM scheduled_tasks WHERE type='inventory' AND status='pending' AND run_at <= ${now}`;
-  for (const t of invRows) {
-    try {
-      const store = await getStore(t.store_key as string);
-      const locationId = (t.location_id as string | null) || store.location_id;
-      if (!locationId) throw new Error('No hay location_id (ni en la tarea ni en la tienda).');
-      const payload = t.payload as { quantity: number; mode: string };
-      if (payload.mode === 'set') await shopifySetInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
-      else await shopifyAdjustInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
-      await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
-      summary.ok++;
-    } catch (e: any) {
-      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
-      summary.failed++;
-    }
-  }
+  const publishRows = await sql`SELECT * FROM scheduled_tasks WHERE type='publish' AND status='pending' AND run_at <= ${now} ORDER BY run_at`;
+  await run(publishRows, async (t) => {
+    const store = await storeFor(t.store_key as string);
+    await shopifySetProductStatus(store, String(t.product_id), 'active');
+    await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
+  });
 
-  const priceStartRows = await sql`SELECT * FROM scheduled_tasks WHERE type='price' AND status='pending' AND run_at <= ${now}`;
-  for (const t of priceStartRows) {
-    try {
-      const store = await getStore(t.store_key as string);
-      const payload = t.payload as { promo_price: string; compare_at_price: string };
+  const invRows = await sql`SELECT * FROM scheduled_tasks WHERE type='inventory' AND status='pending' AND run_at <= ${now} ORDER BY run_at`;
+  await run(invRows, async (t) => {
+    const store = await storeFor(t.store_key as string);
+    const locationId = (t.location_id as string | null) || store.location_id;
+    if (!locationId) throw new Error('No hay location_id (ni en la tarea ni en la tienda).');
+    const payload = t.payload as { quantity: number; mode: string };
+    if (payload.mode === 'set') await shopifySetInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
+    else await shopifyAdjustInventory(store, String(t.inventory_item_id), locationId, payload.quantity);
+    await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
+  });
+
+  const priceStartRows = await sql`SELECT * FROM scheduled_tasks WHERE type='price' AND status='pending' AND run_at <= ${now} ORDER BY run_at`;
+  await run(priceStartRows, async (t) => {
+    const store = await storeFor(t.store_key as string);
+    const payload = t.payload as { promo_price: string; compare_at_price: string; end_mode?: string };
+    let original: string;
+    if (payload.end_mode === 'compare_to_price') {
+      // Al terminar se usa el precio de comparación, así que no hace falta leer ni respaldar el precio
+      // actual: una sola llamada a Shopify por variante (importa por el límite de 2 llamadas/segundo).
+      await shopifyUpdateVariantPrice(store, String(t.variant_id), payload.promo_price, payload.compare_at_price);
+      original = JSON.stringify({ started: true });
+    } else {
       const { data: current } = await shopifyGetVariant(store, String(t.variant_id));
       const originalPrice = current?.variant?.price ?? null;
       const originalCompare = current?.variant?.compare_at_price ?? null;
       if (originalPrice === null) throw new Error('No se pudo leer el precio original.');
       await shopifyUpdateVariantPrice(store, String(t.variant_id), payload.promo_price, payload.compare_at_price);
-      const original = JSON.stringify({ price: originalPrice, compare_at_price: originalCompare });
-      await sql`UPDATE scheduled_tasks SET status='active', original_data=${original}::jsonb WHERE id=${t.id}`;
-      summary.ok++;
-    } catch (e: any) {
-      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
-      summary.failed++;
+      original = JSON.stringify({ price: originalPrice, compare_at_price: originalCompare });
     }
-  }
+    // "AND status='pending'": si dos corridas se cruzaran, no pisa el respaldo de la primera.
+    await sql`UPDATE scheduled_tasks SET status='active', original_data=${original}::jsonb WHERE id=${t.id} AND status='pending'`;
+  });
 
-  const priceRevertRows = await sql`SELECT * FROM scheduled_tasks WHERE type='price' AND status='active' AND revert_at IS NOT NULL AND revert_at <= ${now}`;
-  for (const t of priceRevertRows) {
-    try {
-      const store = await getStore(t.store_key as string);
-      const payload = t.payload as { compare_at_price?: string; end_mode?: string } | null;
-      if (payload?.end_mode === 'compare_to_price') {
-        // El precio de comparación pasa a ser el precio real y el tachado se quita (null = sin precio de comparación).
-        if (!payload.compare_at_price) throw new Error('La tarea no trae precio de comparación.');
-        await shopifyUpdateVariantPrice(store, String(t.variant_id), payload.compare_at_price, null);
-      } else {
-        const original = t.original_data as { price: string; compare_at_price: string | null };
-        if (!original?.price) throw new Error('Sin respaldo de precio original.');
-        await shopifyUpdateVariantPrice(store, String(t.variant_id), original.price, original.compare_at_price);
-      }
-      await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
-      summary.ok++;
-    } catch (e: any) {
-      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
-      summary.failed++;
+  const priceRevertRows = await sql`SELECT * FROM scheduled_tasks WHERE type='price' AND status='active' AND revert_at IS NOT NULL AND revert_at <= ${now} ORDER BY revert_at`;
+  await run(priceRevertRows, async (t) => {
+    const store = await storeFor(t.store_key as string);
+    const payload = t.payload as { compare_at_price?: string; end_mode?: string } | null;
+    if (payload?.end_mode === 'compare_to_price') {
+      // El precio de comparación pasa a ser el precio real y el tachado se quita (null = sin precio de comparación).
+      if (!payload.compare_at_price) throw new Error('La tarea no trae precio de comparación.');
+      await shopifyUpdateVariantPrice(store, String(t.variant_id), payload.compare_at_price, null);
+    } else {
+      const original = t.original_data as { price: string; compare_at_price: string | null };
+      if (!original?.price) throw new Error('Sin respaldo de precio original.');
+      await shopifyUpdateVariantPrice(store, String(t.variant_id), original.price, original.compare_at_price);
     }
-  }
-
-  const themeRows = await sql`SELECT * FROM scheduled_tasks WHERE type='theme_publish' AND status='pending' AND run_at <= ${now}`;
-  for (const t of themeRows) {
-    try {
-      const store = await getStore(t.store_key as string);
-      const payload = t.payload as { theme_id: string; theme_name: string };
-      await shopifyPublishTheme(store, payload.theme_id);
-      await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
-      summary.ok++;
-    } catch (e: any) {
-      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
-      summary.failed++;
-    }
-  }
+    await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
+  });
 
   return summary;
+}
+
+/**
+ * Reintenta tareas fallidas (por ejemplo las que fallaron por el límite de llamadas de Shopify).
+ * Un precio que ya había iniciado (tiene respaldo) vuelve a "activa" para reintentar solo el término;
+ * todo lo demás vuelve a "pendiente". Sin taskId reintenta todas las fallidas.
+ */
+export async function retryTasks(taskId?: number): Promise<number> {
+  const rows = taskId
+    ? await sql`
+        UPDATE scheduled_tasks
+        SET status = CASE
+          WHEN type = 'price' AND original_data IS NOT NULL THEN 'active'
+          WHEN type = 'price_batch' AND original_data->>'started' = 'true' THEN 'active'
+          ELSE 'pending' END, last_error = NULL
+        WHERE id = ${taskId} AND status = 'failed' RETURNING id`
+    : await sql`
+        UPDATE scheduled_tasks
+        SET status = CASE
+          WHEN type = 'price' AND original_data IS NOT NULL THEN 'active'
+          WHEN type = 'price_batch' AND original_data->>'started' = 'true' THEN 'active'
+          ELSE 'pending' END, last_error = NULL
+        WHERE status = 'failed' RETURNING id`;
+  return rows.length;
 }

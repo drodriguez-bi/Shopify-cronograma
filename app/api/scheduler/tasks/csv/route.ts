@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
-  findVariantBySku, findProductByHandle,
-  createPublishTask, createInventoryTask, createPriceTask,
+  findVariantBySku, findProductByHandle, catalogStats,
+  createPublishBatchTask, createInventoryBatchTask, createPriceBatchTask,
+  type PriceItem, type InventoryItem, type PublishItem,
 } from '@/lib/scheduler/core';
 
 export const maxDuration = 60;
@@ -186,6 +187,26 @@ export async function POST(req: NextRequest) {
   const rows = parseCsv(csv);
   if (!rows.length) return NextResponse.json({ ok: false, error: 'El CSV no trae filas.' }, { status: 400 });
 
+  // ---- Diagnóstico del catálogo (para dar un error claro en vez de uno por cada fila) ----
+  let stats = { total: 0, withHandle: 0 };
+  try {
+    stats = await catalogStats(storeKey);
+  } catch (e: any) {
+    if (/handle/i.test(e.message || '')) {
+      return NextResponse.json({ ok: false, error: 'Falta la columna "handle" en la base de datos: corre el ALTER TABLE products_cache ADD COLUMN IF NOT EXISTS handle TEXT en Neon y luego sincroniza la tienda.' }, { status: 400 });
+    }
+    throw e;
+  }
+  const usesHandles = rows.some(r => r.handle && !r.sku);
+  if (usesHandles && stats.total === 0) {
+    return NextResponse.json({ ok: false, error: 'Esta tienda no tiene productos sincronizados. Selecciónala y dale "Sincronizar productos" primero.' }, { status: 400 });
+  }
+  if (usesHandles && stats.withHandle === 0) {
+    return NextResponse.json({ ok: false, error: `Los ${stats.total} productos sincronizados de esta tienda no tienen handle guardado. Confirma que corriste el ALTER TABLE del handle en Neon y que ya está desplegada la versión nueva, y dale "Sincronizar productos" otra vez.` }, { status: 400 });
+  }
+  const missingHandles = new Map<string, number[]>();
+  const foundHandles = new Set<string>();
+
   // La acción la decide el archivo: con precios -> price; con cantidades -> inventory;
   // solo la lista de productos -> publish. (El panel puede forzarla.)
   const hasValue = (keys: string[]) => rows.some(r => keys.some(k => (r[k] ?? '').trim() !== ''));
@@ -207,7 +228,10 @@ export async function POST(req: NextRequest) {
     if (!productCache.has(key)) productCache.set(key, await findProductByHandle(storeKey, handle));
     return productCache.get(key) ?? null;
   }
-  const publishSeen = new Set<string>();
+  // Todo lo del archivo se junta en UNA tarea por acción (y por fecha/modo, si el CSV trae fechas distintas por fila).
+  const pubGroups = new Map<string, { runAt: string; items: PublishItem[]; seen: Set<string> }>();
+  const invGroups = new Map<string, { runAt: string; mode: 'add' | 'set'; locationId: string | null; items: InventoryItem[]; index: Map<string, number> }>();
+  const priceGroups = new Map<string, { runAt: string; revertAt: string; items: PriceItem[]; index: Map<string, number> }>();
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
@@ -242,7 +266,12 @@ export async function POST(req: NextRequest) {
         variants = [v];
       } else {
         const found = await getProduct(row.handle);
-        if (!found) throw new Error(`no se encontró el handle "${row.handle}" (¿ya sincronizaste esta tienda después de la actualización?)`);
+        if (!found) {
+          const key = row.handle.toLowerCase();
+          missingHandles.set(key, [...(missingHandles.get(key) ?? []), i + 2]);
+          continue;
+        }
+        foundHandles.add(row.handle.toLowerCase());
         productId = String(found.product.product_id);
         productTitle = found.product.title as string;
 
@@ -266,10 +295,11 @@ export async function POST(req: NextRequest) {
 
       // ---- Crear tareas ----
       if (type === 'publish') {
-        const key = `${productId}|${runAt}`;
-        if (publishSeen.has(key)) { skipped++; continue; }
-        publishSeen.add(key);
-        if (!dryRun) await createPublishTask(storeKey, productId, row.label || productTitle, runAt, 'csv');
+        const g = pubGroups.get(runAt) ?? { runAt, items: [], seen: new Set<string>() };
+        pubGroups.set(runAt, g);
+        if (g.seen.has(productId)) { skipped++; continue; } // mismo producto repetido (una fila por variante)
+        g.seen.add(productId);
+        g.items.push({ product_id: productId, label: row.label || productTitle });
         addPreview(`Publicar: ${productTitle}`);
         created++;
         continue;
@@ -277,17 +307,18 @@ export async function POST(req: NextRequest) {
 
       if (type === 'inventory') {
         const quantity = parseInt(quantityRaw, 10);
-        const mode = (row.mode || panelMode) === 'set' ? 'set' : 'add';
+        const mode: 'add' | 'set' = (row.mode || panelMode) === 'set' ? 'set' : 'add';
         if (!quantity || quantity <= 0) throw new Error(`quantity inválido: "${quantityRaw}"`);
         for (const v of variants) {
           const label = row.label || `${productTitle} — ${v.title ?? ''}`.trim();
-          if (!dryRun) {
-            await createInventoryTask(
-              storeKey, productId, String(v.variant_id),
-              v.inventory_item_id ? String(v.inventory_item_id) : null,
-              label, quantity, mode, runAt, row.location_id || fallbackLocationId || null, 'csv'
-            );
-          }
+          if (!v.inventory_item_id) throw new Error(`la variante "${v.title ?? v.variant_id}" no tiene inventory_item_id (sincroniza de nuevo la tienda)`);
+          const loc: string | null = row.location_id || fallbackLocationId || null;
+          const key = `${runAt}|${mode}|${loc ?? ''}`;
+          const g = invGroups.get(key) ?? { runAt, mode, locationId: loc, items: [], index: new Map<string, number>() };
+          invGroups.set(key, g);
+          const item: InventoryItem = { product_id: productId, variant_id: String(v.variant_id), inventory_item_id: String(v.inventory_item_id), label, quantity };
+          const at = g.index.get(item.variant_id);
+          if (at === undefined) { g.index.set(item.variant_id, g.items.length); g.items.push(item); } else g.items[at] = item;
           addPreview(`${label}: ${mode === 'set' ? 'fijar en' : 'sumar'} ${quantity} (stock actual ${v.inventory_qty})`);
           created++;
         }
@@ -310,9 +341,12 @@ export async function POST(req: NextRequest) {
         }
         if (!compare || compare <= 0) throw new Error('no se pudo determinar el precio de comparación');
         const label = row.label || `${productTitle} — ${v.title ?? ''}`.trim();
-        if (!dryRun) {
-          await createPriceTask(storeKey, productId, String(v.variant_id), label, promo, compare, runAt, revertAt, 'csv', 'compare_to_price');
-        }
+        const key = `${runAt}|${revertAt}`;
+        const g = priceGroups.get(key) ?? { runAt, revertAt, items: [], index: new Map<string, number>() };
+        priceGroups.set(key, g);
+        const item: PriceItem = { product_id: productId, variant_id: String(v.variant_id), label, promo_price: promo.toFixed(2), compare_at_price: compare.toFixed(2) };
+        const at = g.index.get(item.variant_id);
+        if (at === undefined) { g.index.set(item.variant_id, g.items.length); g.items.push(item); } else g.items[at] = item;
         addPreview(`${label}: inicia en $${promo} con tachado $${compare} (ahora $${v.price}); al terminar: $${compare} sin tachado`);
         created++;
       }
@@ -321,5 +355,41 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  return NextResponse.json({ ok: true, dryRun, action: effectiveAction, created, skipped, errors, preview });
+  // ---- Crear las tareas (una por acción) ----
+  let batches = 0;
+  try {
+    for (const g of pubGroups.values()) {
+      if (!g.items.length) continue;
+      batches++;
+      if (!dryRun) await createPublishBatchTask(storeKey, g.items, g.runAt, 'csv');
+    }
+    for (const g of invGroups.values()) {
+      if (!g.items.length) continue;
+      batches++;
+      if (!dryRun) await createInventoryBatchTask(storeKey, g.items, g.runAt, g.mode, g.locationId, 'csv');
+    }
+    for (const g of priceGroups.values()) {
+      if (!g.items.length) continue;
+      batches++;
+      // Del CSV: al terminar, el precio de comparación pasa a ser el precio real y se quita el tachado.
+      if (!dryRun) await createPriceBatchTask(storeKey, g.items, g.runAt, g.revertAt, 'compare_to_price', 'csv');
+    }
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: `No se pudo crear la tarea: ${e.message}` }, { status: 500 });
+  }
+
+  for (const [handle, rowNums] of missingHandles) {
+    const where = rowNums.length === 1 ? `fila ${rowNums[0]}` : `filas ${rowNums[0]} a ${rowNums[rowNums.length - 1]} (${rowNums.length} filas)`;
+    errors.push({ row: rowNums[0], error: `el producto "${handle}" no existe en esta tienda (${where})` });
+  }
+  errors.sort((a, b) => a.row - b.row);
+
+  let hint = '';
+  if (missingHandles.size > 0 && foundHandles.size === 0) {
+    hint = `Ninguno de los ${missingHandles.size} productos del archivo existe en la tienda seleccionada (tiene ${stats.total} productos sincronizados). Revisa que elegiste la tienda correcta y que el CSV sea de esa tienda.`;
+  } else if (missingHandles.size > 0) {
+    hint = `${missingHandles.size} producto(s) del archivo no existen en esta tienda. Si deberían existir, vuelve a sincronizar (por ejemplo, si son productos nuevos o les cambiaron el handle).`;
+  }
+
+  return NextResponse.json({ ok: true, dryRun, action: effectiveAction, created, batches, skipped, errors, preview, hint });
 }

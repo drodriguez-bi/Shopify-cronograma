@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_variants_sku ON variants_cache (store_key, sku);
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
   id SERIAL PRIMARY KEY,
   store_key TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('publish','inventory','price','theme_publish')),
+  type TEXT NOT NULL CHECK (type IN ('publish','inventory','price','theme_publish','price_batch','inventory_batch','publish_batch')),
   product_id BIGINT NULL,
   variant_id BIGINT NULL,
   inventory_item_id BIGINT NULL,
