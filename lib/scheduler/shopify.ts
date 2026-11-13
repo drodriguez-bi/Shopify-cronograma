@@ -86,3 +86,53 @@ export async function shopifySetInventory(store: Store, inventoryItemId: string,
 export async function shopifyListLocations(store: Store) {
   return shopifyRequest(store, 'GET', '/locations.json');
 }
+
+// ---------------------------------------------------------
+// Temas (Admin GraphQL). Requiere scopes read_themes / write_themes
+// y una api_version reciente (2024-10 o mayor) en la tienda.
+// ---------------------------------------------------------
+
+async function shopifyGraphql(store: Store, query: string, variables: Record<string, unknown> = {}) {
+  if (!store.access_token) {
+    throw new Error(`La tienda '${store.name}' todavía no está conectada. Ve a "Tiendas" y dale clic en "Conectar".`);
+  }
+  const domain = cleanDomain(store.domain);
+  const res = await fetch(`https://${domain}/admin/api/${store.api_version}/graphql.json`, {
+    method: 'POST',
+    headers: { 'X-Shopify-Access-Token': store.access_token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (res.status === 401) {
+    throw new Error(`Token inválido o vencido para ${domain}. Reconecta la tienda.`);
+  }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Shopify GraphQL error ${res.status}: ${JSON.stringify(json)}`);
+  if (json.errors?.length) {
+    const msg = JSON.stringify(json.errors);
+    if (/access denied|scope|themes/i.test(msg)) {
+      throw new Error(`Sin permiso para temas (falta read_themes/write_themes: reconecta la tienda). Detalle: ${msg}`);
+    }
+    throw new Error(`Shopify GraphQL: ${msg}`);
+  }
+  return json.data;
+}
+
+export type ShopifyTheme = { id: string; name: string; role: string };
+
+export async function shopifyListThemes(store: Store): Promise<ShopifyTheme[]> {
+  const data = await shopifyGraphql(store, `query { themes(first: 50) { nodes { id name role } } }`);
+  return (data.themes?.nodes ?? []) as ShopifyTheme[];
+}
+
+export async function shopifyPublishTheme(store: Store, themeGid: string) {
+  const data = await shopifyGraphql(
+    store,
+    `mutation themePublish($id: ID!) {
+       themePublish(id: $id) { theme { id name role } userErrors { field message code } }
+     }`,
+    { id: themeGid }
+  );
+  const errors = data.themePublish?.userErrors ?? [];
+  if (errors.length) throw new Error(`themePublish: ${errors.map((e: any) => e.message).join('; ')}`);
+  return data.themePublish.theme as ShopifyTheme;
+}

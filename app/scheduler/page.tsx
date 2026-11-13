@@ -17,7 +17,7 @@ type Task = {
 };
 
 const statusLabels: Record<string, string> = { pending: 'Pendiente', active: 'Activa', completed: 'Completada', failed: 'Fallida', cancelled: 'Cancelada' };
-const typeLabels: Record<string, string> = { publish: 'Publicación', inventory: 'Inventario', price: 'Precio promo' };
+const typeLabels: Record<string, string> = { publish: 'Publicación', inventory: 'Inventario', price: 'Precio promo', theme_publish: 'Publicar tema' };
 
 function toIso(datetimeLocal: string): string {
   return new Date(datetimeLocal).toISOString();
@@ -30,6 +30,10 @@ export default function SchedulerPage() {
   const [locations, setLocations] = useState<{ id: string; name: string; active: boolean }[]>([]);
   const [locationId, setLocationId] = useState('');
   const [loadingLocations, setLoadingLocations] = useState(false);
+  const [themes, setThemes] = useState<{ id: string; name: string; role: string }[]>([]);
+  const [themeId, setThemeId] = useState('');
+  const [themeRunAt, setThemeRunAt] = useState('');
+  const [themesMsg, setThemesMsg] = useState('');
   const [products, setProducts] = useState<Product[]>([]);
   const [selectedProducts, setSelectedProducts] = useState<Set<number>>(new Set());
   const [selectedVariants, setSelectedVariants] = useState<Set<number>>(new Set());
@@ -56,13 +60,32 @@ export default function SchedulerPage() {
     setLocationId('');
     setLocations([]);
     setProducts([]);
-    if (storeKey) loadLocations(storeKey);
+    setThemes([]);
+    setThemeId('');
+    setThemesMsg('');
+    if (storeKey) { loadLocations(storeKey); loadThemes(storeKey); }
   }, [storeKey]);
   useEffect(() => { if (storeKey && locationId) loadProducts(storeKey); else setProducts([]); }, [storeKey, locationId]);
 
   async function loadStores() {
     const res = await fetch('/api/scheduler/stores').then(r => r.json());
     if (res.ok) setStores(res.stores);
+  }
+  async function loadThemes(key: string) {
+    const res = await fetch(`/api/scheduler/themes?storeKey=${encodeURIComponent(key)}`).then(r => r.json());
+    if (res.ok) setThemes(res.themes);
+    else setThemesMsg('No se pudieron cargar los temas: ' + res.error);
+  }
+  async function submitTheme() {
+    if (!themeId || !themeRunAt) return alert('Elige el tema y la fecha/hora.');
+    const theme = themes.find(t => t.id === themeId);
+    if (!confirm(`¿Programar la publicación de "${theme?.name}"? Al llegar la hora reemplazará al tema publicado.`)) return;
+    const res = await fetch('/api/scheduler/tasks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'schedule_theme_publish', storeKey, themeId, themeName: theme?.name, runAt: toIso(themeRunAt) }),
+    }).then(r => r.json());
+    if (res.ok) { alert('Publicación de tema programada.'); setThemeId(''); setThemeRunAt(''); loadTasks(); }
+    else alert('Error: ' + res.error);
   }
   async function loadLocations(key: string) {
     setLoadingLocations(true);
@@ -227,6 +250,26 @@ export default function SchedulerPage() {
         {!stores.length && <span className="text-xs text-red-600">No hay tiendas — ve a "Tiendas" y agrega una.</span>}
         {storeKey && !locationId && !loadingLocations && <span className="text-xs text-gray-500">Elige una sucursal para ver los productos.</span>}
       </div>
+
+      {storeKey && (
+        <div className="flex items-end gap-3 bg-white shadow rounded-lg p-4 flex-wrap">
+          <strong className="text-sm self-center">Publicar tema</strong>
+          <label className="text-sm">Tema (copia lista para publicar)
+            <select value={themeId} onChange={e => setThemeId(e.target.value)} className="block border rounded px-2 py-1 mt-1">
+              <option value="">-- Selecciona --</option>
+              {themes.filter(t => t.role !== 'MAIN').map(t => (
+                <option key={t.id} value={t.id}>{t.name} ({t.role.toLowerCase()})</option>
+              ))}
+            </select>
+          </label>
+          <label className="text-sm">Fecha y hora
+            <input type="datetime-local" value={themeRunAt} onChange={e => setThemeRunAt(e.target.value)} className="block border rounded px-2 py-1 mt-1" />
+          </label>
+          <button disabled={!themeId || !themeRunAt} onClick={submitTheme} className="px-3 py-1.5 bg-black text-white rounded text-sm disabled:opacity-40">Programar publicación</button>
+          {(() => { const main = themes.find(t => t.role === 'MAIN'); return main ? <span className="text-xs text-gray-500">Publicado ahora: {main.name}</span> : null; })()}
+          {themesMsg && <span className="text-xs text-red-600">{themesMsg}</span>}
+        </div>
+      )}
 
       {(selectedProducts.size > 0 || selectedVariants.size > 0) && (
         <div className="flex items-center gap-3 bg-white shadow rounded-lg p-4">

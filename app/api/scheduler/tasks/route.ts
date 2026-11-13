@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { sql } from '@/lib/scheduler/db';
-import { createPublishTask, createInventoryTask, createPriceTask } from '@/lib/scheduler/core';
+import { createPublishTask, createInventoryTask, createPriceTask, createThemePublishTask } from '@/lib/scheduler/core';
 
 export async function GET() {
   const tasks = await sql`SELECT * FROM scheduled_tasks ORDER BY run_at DESC LIMIT 300`;
@@ -65,6 +65,14 @@ export async function POST(req: NextRequest) {
         created++;
       }
       return NextResponse.json({ ok: true, created, errors });
+    }
+
+    if (body.action === 'schedule_theme_publish') {
+      if (!body.storeKey || !body.themeId || !body.runAt) {
+        return NextResponse.json({ ok: false, error: 'storeKey, themeId y runAt requeridos' }, { status: 400 });
+      }
+      await createThemePublishTask(body.storeKey, body.themeId, body.themeName || body.themeId, body.runAt);
+      return NextResponse.json({ ok: true, created: 1 });
     }
 
     return NextResponse.json({ ok: false, error: 'Acción desconocida' }, { status: 400 });

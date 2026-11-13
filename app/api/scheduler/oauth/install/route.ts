@@ -3,7 +3,7 @@ import { randomBytes } from 'crypto';
 import { getStore } from '@/lib/scheduler/core';
 import { cleanDomain } from '@/lib/scheduler/shopify';
 
-const APP_SCOPES = 'read_products,write_products,read_inventory,write_inventory,read_locations';
+const APP_SCOPES = 'read_products,write_products,read_inventory,write_inventory,read_locations,read_themes,write_themes';
 
 export async function GET(req: NextRequest) {
   const storeKey = req.nextUrl.searchParams.get('store') || '';

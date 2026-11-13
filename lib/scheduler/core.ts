@@ -2,6 +2,7 @@ import { sql } from './db';
 import {
   Store, shopifyListProducts, shopifySetProductStatus, shopifyGetVariant,
   shopifyUpdateVariantPrice, shopifyAdjustInventory, shopifySetInventory,
+  shopifyListThemes, shopifyPublishTheme,
 } from './shopify';
 
 // ---------------------------------------------------------
@@ -184,6 +185,21 @@ export async function createPriceTask(
   return rows[0].id as number;
 }
 
+export async function createThemePublishTask(storeKey: string, themeGid: string, themeName: string, runAt: string) {
+  const payload = JSON.stringify({ theme_id: themeGid, theme_name: themeName });
+  const rows = await sql`
+    INSERT INTO scheduled_tasks (store_key, type, label, payload, run_at)
+    VALUES (${storeKey}, 'theme_publish', ${'Tema: ' + themeName}, ${payload}::jsonb, ${runAt})
+    RETURNING id
+  `;
+  return rows[0].id as number;
+}
+
+export async function listStoreThemes(storeKey: string) {
+  const store = await getStore(storeKey);
+  return shopifyListThemes(store);
+}
+
 export async function cancelTask(taskId: number) {
   await sql`UPDATE scheduled_tasks SET status = 'cancelled' WHERE id = ${taskId} AND status IN ('pending','active')`;
 }
@@ -252,6 +268,20 @@ export async function runDueTasks(): Promise<{ ok: number; failed: number }> {
       const original = t.original_data as { price: string; compare_at_price: string | null };
       if (!original?.price) throw new Error('Sin respaldo de precio original.');
       await shopifyUpdateVariantPrice(store, String(t.variant_id), original.price, original.compare_at_price);
+      await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
+      summary.ok++;
+    } catch (e: any) {
+      await sql`UPDATE scheduled_tasks SET status='failed', last_error=${e.message} WHERE id=${t.id}`;
+      summary.failed++;
+    }
+  }
+
+  const themeRows = await sql`SELECT * FROM scheduled_tasks WHERE type='theme_publish' AND status='pending' AND run_at <= ${now}`;
+  for (const t of themeRows) {
+    try {
+      const store = await getStore(t.store_key as string);
+      const payload = t.payload as { theme_id: string; theme_name: string };
+      await shopifyPublishTheme(store, payload.theme_id);
       await sql`UPDATE scheduled_tasks SET status='completed' WHERE id=${t.id}`;
       summary.ok++;
     } catch (e: any) {

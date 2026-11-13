@@ -137,3 +137,19 @@ curl -H "Authorization: Bearer TU_CRON_SECRET" https://tuapp.vercel.app/api/sche
 - Import por CSV como alternativa al panel manual (no existía en la versión PHP).
 - Sin la herramienta `diag.php` — si la necesitas, dímelo y hago el
   equivalente como ruta de API.
+
+
+## 10. Publicar tema en fecha
+
+Tarjeta "Publicar tema" en el panel (aparece al elegir tienda): eliges una copia
+del tema (cualquiera que no sea el publicado), fecha y hora, y a esa hora el cron
+lo publica. No hay regreso automático: el tema nuevo se queda como principal.
+
+Para activarlo:
+1. Corre `sql/migration_themes.sql` en Neon (permite el tipo `theme_publish` y
+   hace `product_id` opcional).
+2. En Shopify Partners, agrega los scopes `read_themes` y `write_themes` a la app
+   (el código ya los pide en `oauth/install`).
+3. En el panel, dale **Reconectar** a cada tienda para que tome los scopes nuevos.
+4. La tienda debe usar una API version reciente (2024-10 o mayor) porque se usa
+   GraphQL (`themes`, `themePublish`).
